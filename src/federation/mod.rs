@@ -27,5 +27,5 @@ pub use discovery::{
     discover, forwarded_socket_path, DiscoveryConfig, StaticOrigin, TailscaleStatus,
 };
 pub use namespace::{is_foreign, namespace_terminal_id, parse_foreign_terminal_id};
-pub use origin::{ConnectionTarget, Origin, OriginKey};
+pub use origin::{ConnectionTarget, InvalidOriginKey, Origin, OriginKey};
 pub use registry::{FederationRegistry, ReconcileDelta};

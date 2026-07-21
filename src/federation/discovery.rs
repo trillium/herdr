@@ -84,6 +84,9 @@ pub struct DiscoveryConfig {
 }
 
 /// Convention for where an origin's `ssh -L`-forwarded JSON API socket lands.
+///
+/// [`OriginKey`] construction guarantees the key is filename-safe (no path
+/// separators or `..`), so the result is always inside `dir`.
 pub fn forwarded_socket_path(dir: &Path, key: &OriginKey) -> PathBuf {
     dir.join(format!("{}.sock", key.as_str()))
 }
@@ -91,7 +94,8 @@ pub fn forwarded_socket_path(dir: &Path, key: &OriginKey) -> PathBuf {
 /// Compute the reachable origins: online tailnet peers (via the forwarded-socket
 /// convention) unioned with static config origins. Static origins win on key
 /// conflict — they carry an explicit socket path and label. The local `Self`
-/// node is never federated to itself. Offline peers are excluded.
+/// node is never federated to itself. Offline peers and peers whose id is not a
+/// valid [`OriginKey`] are excluded.
 pub fn discover(status: &TailscaleStatus, config: &DiscoveryConfig) -> Vec<Origin> {
     let mut by_key: std::collections::BTreeMap<OriginKey, Origin> =
         std::collections::BTreeMap::new();
@@ -105,7 +109,9 @@ pub fn discover(status: &TailscaleStatus, config: &DiscoveryConfig) -> Vec<Origi
         if self_id.as_deref() == Some(node.id.as_str()) {
             continue;
         }
-        let key = OriginKey::new(node.id.clone());
+        let Ok(key) = OriginKey::new(node.id.clone()) else {
+            continue;
+        };
         let target = ConnectionTarget::LocalSocket(forwarded_socket_path(
             &config.forwarded_socket_dir,
             &key,
@@ -160,7 +166,7 @@ mod tests {
         // Only the online peer (mini1); self excluded, offline mini2 excluded.
         assert_eq!(origins.len(), 1);
         let mini1 = &origins[0];
-        assert_eq!(mini1.key, OriginKey::new("nMINI1"));
+        assert_eq!(mini1.key, OriginKey::new("nMINI1").unwrap());
         assert_eq!(mini1.label, "trilliums-mini");
         assert_eq!(
             mini1.target,
@@ -177,7 +183,7 @@ mod tests {
         let cfg = DiscoveryConfig {
             forwarded_socket_dir: PathBuf::from("/run/herdr/fed"),
             static_origins: vec![StaticOrigin {
-                key: OriginKey::new("static-box"),
+                key: OriginKey::new("static-box").unwrap(),
                 label: Some("build-box".to_string()),
                 socket_path: PathBuf::from("/tmp/build.sock"),
             }],
@@ -197,7 +203,7 @@ mod tests {
         let cfg = DiscoveryConfig {
             forwarded_socket_dir: PathBuf::from("/run/herdr/fed"),
             static_origins: vec![StaticOrigin {
-                key: OriginKey::new("nMINI1"),
+                key: OriginKey::new("nMINI1").unwrap(),
                 label: None,
                 socket_path: PathBuf::from("/custom/mini1.sock"),
             }],
@@ -223,12 +229,12 @@ mod tests {
             forwarded_socket_dir: PathBuf::from("/unused"),
             static_origins: vec![
                 StaticOrigin {
-                    key: OriginKey::new("sess-a"),
+                    key: OriginKey::new("sess-a").unwrap(),
                     label: Some("A".to_string()),
                     socket_path: PathBuf::from("/tmp/a.sock"),
                 },
                 StaticOrigin {
-                    key: OriginKey::new("sess-b"),
+                    key: OriginKey::new("sess-b").unwrap(),
                     label: Some("B".to_string()),
                     socket_path: PathBuf::from("/tmp/b.sock"),
                 },
@@ -240,7 +246,41 @@ mod tests {
 
     #[test]
     fn forwarded_socket_path_follows_convention() {
-        let path = forwarded_socket_path(Path::new("/run/herdr/fed"), &OriginKey::new("nMINI1"));
+        let path = forwarded_socket_path(
+            Path::new("/run/herdr/fed"),
+            &OriginKey::new("nMINI1").unwrap(),
+        );
         assert_eq!(path, PathBuf::from("/run/herdr/fed/nMINI1.sock"));
+    }
+
+    #[test]
+    fn peers_with_invalid_ids_are_skipped() {
+        let status = TailscaleStatus {
+            self_node: None,
+            peers: HashMap::from([(
+                "key1".to_string(),
+                TailscaleNode {
+                    id: "bad~id".to_string(),
+                    host_name: "rogue".to_string(),
+                    dns_name: String::new(),
+                    online: true,
+                },
+            )]),
+        };
+        assert!(discover(&status, &config()).is_empty());
+    }
+
+    #[test]
+    fn socket_paths_cannot_escape_the_socket_dir() {
+        // Keys with path separators or '..' are rejected at construction, so no
+        // OriginKey can ever produce a socket path outside the configured dir.
+        assert!(OriginKey::new("../../etc/cron.d/evil").is_err());
+        assert!(OriginKey::new("sub/dir").is_err());
+        assert!(OriginKey::new("..").is_err());
+
+        let dir = Path::new("/run/herdr/fed");
+        let path = forwarded_socket_path(dir, &OriginKey::new("mini.local").unwrap());
+        assert!(path.starts_with(dir));
+        assert_eq!(path.components().count(), dir.components().count() + 1);
     }
 }

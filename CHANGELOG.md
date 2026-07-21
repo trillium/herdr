@@ -1,5 +1,8 @@
 # Changelog
 
+## 2026-07-21 — session ccad7a0c
+
+Files: src/federation/origin.rs, src/federation/namespace.rs, src/federation/discovery.rs, src/federation/mod.rs, src/federation/registry.rs
 ## Unreleased
 
 ## [0.7.5] - 2026-07-21

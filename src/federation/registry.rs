@@ -116,7 +116,7 @@ mod tests {
 
     fn origin(key: &str, label: &str, sock: &str) -> Origin {
         Origin::new(
-            OriginKey::new(key),
+            OriginKey::new(key).unwrap(),
             label,
             ConnectionTarget::LocalSocket(PathBuf::from(sock)),
         )
@@ -131,7 +131,10 @@ mod tests {
 
         assert_eq!(prev.map(|o| o.label), Some("old-name".to_string()));
         assert_eq!(reg.len(), 1);
-        assert_eq!(reg.get(&OriginKey::new("n1")).unwrap().label, "new-name");
+        assert_eq!(
+            reg.get(&OriginKey::new("n1").unwrap()).unwrap().label,
+            "new-name"
+        );
     }
 
     #[test]
@@ -158,8 +161,8 @@ mod tests {
             origin("n3", "c", "/tmp/c.sock"),
         ]);
 
-        assert_eq!(delta.added, vec![OriginKey::new("n3")]);
-        assert_eq!(delta.updated, vec![OriginKey::new("n2")]);
+        assert_eq!(delta.added, vec![OriginKey::new("n3").unwrap()]);
+        assert_eq!(delta.updated, vec![OriginKey::new("n2").unwrap()]);
         assert!(delta.removed.is_empty());
         assert_eq!(reg.len(), 3);
 
@@ -169,7 +172,7 @@ mod tests {
         assert!(delta.updated.is_empty());
         assert_eq!(
             delta.removed,
-            vec![OriginKey::new("n1"), OriginKey::new("n2")]
+            vec![OriginKey::new("n1").unwrap(), OriginKey::new("n2").unwrap()]
         );
         assert_eq!(reg.len(), 1);
     }
@@ -179,7 +182,7 @@ mod tests {
         let mut reg = FederationRegistry::new();
         reg.upsert(origin("n1", "a", "/tmp/a.sock"));
         let delta = reg.reconcile(vec![]);
-        assert_eq!(delta.removed, vec![OriginKey::new("n1")]);
+        assert_eq!(delta.removed, vec![OriginKey::new("n1").unwrap()]);
         assert!(reg.is_empty());
     }
 }
