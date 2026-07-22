@@ -29,7 +29,8 @@ pub use discovery::{
 };
 pub use ingest::{foreign_rows, ForeignRows, IngestError, RemoteSnapshot};
 pub use namespace::{
-    is_foreign, namespace_public_id, namespace_terminal_id, parse_foreign_terminal_id,
+    is_foreign, is_foreign_workspace_id, namespace_public_id, namespace_terminal_id,
+    parse_foreign_terminal_id,
 };
 pub use origin::{ConnectionTarget, InvalidOriginKey, Origin, OriginKey};
 pub use registry::{FederationRegistry, ReconcileDelta};

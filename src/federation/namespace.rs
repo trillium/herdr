@@ -54,6 +54,33 @@ pub fn parse_foreign_terminal_id(id: &TerminalId) -> Option<(OriginKey, Terminal
     Some((OriginKey::new(key).ok()?, TerminalId::from_string(raw)))
 }
 
+/// Split a namespaced foreign public id (workspace/tab/pane) into `(origin, raw)`.
+///
+/// The string-form counterpart of [`parse_foreign_terminal_id`]: workspace ids
+/// (and the tab/pane public ids herdr derives from them) are plain strings, so
+/// this validates the same `fed~<key>~<raw>` shape without a [`TerminalId`]
+/// wrapper. Returns `None` for local ids and for ids whose origin segment is
+/// not a valid [`OriginKey`].
+fn parse_foreign_public_id(id: &str) -> Option<(OriginKey, &str)> {
+    let rest = id.strip_prefix(FED_PREFIX)?;
+    let (key, raw) = rest.split_once(SEP)?;
+    if raw.is_empty() {
+        return None;
+    }
+    Some((OriginKey::new(key).ok()?, raw))
+}
+
+/// Whether a workspace (or other public) id is a well-formed namespaced foreign
+/// id.
+///
+/// Mirrors [`is_foreign`] for terminal ids but operates on the raw string form
+/// herdr uses for workspace/tab/pane public ids, validating the full
+/// `fed~<key>~<raw>` shape (not just the prefix) so a malformed value like
+/// `fed~n1` is not treated as foreign.
+pub fn is_foreign_workspace_id(id: &str) -> bool {
+    parse_foreign_public_id(id).is_some()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -89,6 +116,21 @@ mod tests {
         let local = TerminalId::from_string("term_18f2a3c1");
         assert!(!is_foreign(&local));
         assert!(parse_foreign_terminal_id(&local).is_none());
+    }
+
+    #[test]
+    fn workspace_id_predicate_matches_terminal_shape() {
+        let origin = OriginKey::new("n1").unwrap();
+        let foreign = namespace_public_id(&origin, "w5");
+        assert_eq!(foreign, "fed~n1~w5");
+        assert!(is_foreign_workspace_id(&foreign));
+
+        // Local workspace ids and malformed prefixes are not foreign.
+        assert!(!is_foreign_workspace_id("w5"));
+        assert!(!is_foreign_workspace_id("workspace-local"));
+        for malformed in ["fed~n1", "fed~~raw", "fed~n1~"] {
+            assert!(!is_foreign_workspace_id(malformed), "{malformed}");
+        }
     }
 
     #[test]

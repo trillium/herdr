@@ -1593,6 +1593,54 @@ impl AppState {
         self.session_dirty = true;
     }
 
+    /// Replace all foreign (federated) rows in this state with `rows`. Idempotent:
+    /// every previously-injected `fed~`-namespaced workspace and terminal is
+    /// removed first, then `rows` are appended after local state. Never mutates
+    /// `active`, `selected`, or any local workspace/terminal. Read-only
+    /// projection — foreign panes carry dead channels and receive no input.
+    //
+    // Only tests exercise this until N1c wires it into the runtime (the async
+    // poll loop, via the flag-gated seam), so the non-test build sees it unused.
+    #[allow(dead_code)]
+    pub fn set_foreign_rows(&mut self, rows: crate::federation::ForeignRows) {
+        // Strip previously-injected foreign rows, keyed on the origin-namespace
+        // predicate (never a raw string check) so repeated calls replace rather
+        // than accumulate.
+        self.workspaces
+            .retain(|ws| !crate::federation::is_foreign_workspace_id(&ws.id));
+        self.terminals
+            .retain(|id, _| crate::federation::parse_foreign_terminal_id(id).is_none());
+
+        let foreign_workspaces = rows.workspaces.len();
+        let foreign_terminals = rows.terminals.len();
+
+        // Foreign terminal ids are origin-namespaced and foreign pane ids are
+        // globally allocated, so neither can alias local state — insert without
+        // re-keying.
+        for (terminal_id, terminal) in rows.terminals {
+            self.terminals.insert(terminal_id, terminal);
+        }
+        // Append after local workspaces; never insert before them, so any
+        // `active`/`selected` index into local workspaces is preserved.
+        self.workspaces.extend(rows.workspaces);
+
+        debug_assert!(
+            self.active
+                .is_none_or(|active| active < self.workspaces.len()),
+            "foreign splice must not invalidate the active workspace index"
+        );
+        debug_assert!(
+            self.workspaces.is_empty() || self.selected < self.workspaces.len(),
+            "foreign splice must not invalidate the selected workspace index"
+        );
+
+        tracing::debug!(
+            foreign_workspaces,
+            foreign_terminals,
+            "federation: spliced foreign rows into app state"
+        );
+    }
+
     pub(crate) fn remove_alias_shadowed_by_new_pane(&mut self, pane_id: PaneId) {
         self.pane_id_aliases.remove(&pane_id.raw());
     }
@@ -2336,14 +2384,11 @@ mod tests {
 
     // --- Federation foreign-row splice (N1b) characterization ------------------
     //
-    // These pin the identity invariants the N1b splice must never break. Until
-    // the production `AppState::set_foreign_rows` lands (next commit) the splice
-    // is exercised through `splice_foreign_rows_reference`, a hand-verified
-    // reference implementation of the exact contract: strip previously-injected
-    // `fed~`-namespaced rows, append the new ones strictly after local state,
-    // and never touch focus. The next commit repoints this helper at the real
-    // method with the assertions unchanged, so a divergent implementation fails
-    // these tests.
+    // These pin the identity invariants the N1b splice must never break. They
+    // exercise the production `AppState::set_foreign_rows` directly: strip
+    // previously-injected `fed~`-namespaced rows, append the new ones strictly
+    // after local state, and never touch focus. A divergent implementation
+    // fails these tests.
 
     fn sample_origin(key: &str, label: &str) -> crate::federation::Origin {
         crate::federation::Origin::new(
@@ -2370,22 +2415,7 @@ mod tests {
     }
 
     fn is_foreign_workspace(ws: &crate::workspace::Workspace) -> bool {
-        ws.id.starts_with("fed~")
-    }
-
-    /// Reference splice: the invariant contract the production
-    /// `AppState::set_foreign_rows` must satisfy. Removal keys on the foreign
-    /// namespace (terminals via the real parser, workspaces via the `fed~`
-    /// prefix), insertion appends after local rows, focus is left untouched.
-    fn splice_foreign_rows_reference(state: &mut AppState, rows: crate::federation::ForeignRows) {
-        state.workspaces.retain(|ws| !is_foreign_workspace(ws));
-        state
-            .terminals
-            .retain(|id, _| crate::federation::parse_foreign_terminal_id(id).is_none());
-        for (terminal_id, terminal) in rows.terminals {
-            state.terminals.insert(terminal_id, terminal);
-        }
-        state.workspaces.extend(rows.workspaces);
+        crate::federation::is_foreign_workspace_id(&ws.id)
     }
 
     #[test]
@@ -2396,7 +2426,7 @@ mod tests {
         let local_ws = state.workspaces.len();
         let local_terminals = state.terminals.len();
 
-        splice_foreign_rows_reference(&mut state, sample_foreign_rows("n1", "mini"));
+        state.set_foreign_rows(sample_foreign_rows("n1", "mini"));
 
         // Foreign rows actually landed (fixture: one workspace, two terminals).
         assert!(
@@ -2422,13 +2452,13 @@ mod tests {
     fn foreign_splice_is_idempotent() {
         let mut state = AppState::test_with_adversarial_identity_state();
 
-        splice_foreign_rows_reference(&mut state, sample_foreign_rows("n1", "mini"));
+        state.set_foreign_rows(sample_foreign_rows("n1", "mini"));
         let workspaces_after_one = state.workspaces.len();
         let terminals_after_one = state.terminals.len();
 
         // Re-splicing the same rows (as a poll loop will) must not duplicate
         // `fed~` workspaces or terminals — replace semantics, not accumulate.
-        splice_foreign_rows_reference(&mut state, sample_foreign_rows("n1", "mini"));
+        state.set_foreign_rows(sample_foreign_rows("n1", "mini"));
 
         assert_eq!(
             state.workspaces.len(),
@@ -2451,7 +2481,7 @@ mod tests {
         let active_before = state.active;
         let selected_before = state.selected;
 
-        splice_foreign_rows_reference(&mut state, sample_foreign_rows("n1", "mini"));
+        state.set_foreign_rows(sample_foreign_rows("n1", "mini"));
 
         // Local workspaces keep their original indices and order at the front.
         for (idx, id) in local_ids.iter().enumerate() {
@@ -2497,12 +2527,12 @@ mod tests {
 
         // Splice foreign rows in, then strip them with an empty set (the flag-off
         // / disabled path).
-        splice_foreign_rows_reference(&mut state, sample_foreign_rows("n1", "mini"));
+        state.set_foreign_rows(sample_foreign_rows("n1", "mini"));
         assert!(
             state.workspaces.iter().any(is_foreign_workspace),
             "foreign workspace present before strip"
         );
-        splice_foreign_rows_reference(&mut state, empty_foreign_rows());
+        state.set_foreign_rows(empty_foreign_rows());
 
         // Local state is byte-identical: same workspace ids in order, same
         // terminals, same focus, and zero foreign residue.
@@ -2542,7 +2572,7 @@ mod tests {
     #[test]
     fn sidebar_surfaces_foreign_entries() {
         let mut state = AppState::test_with_adversarial_identity_state();
-        splice_foreign_rows_reference(&mut state, sample_foreign_rows("n1", "mini"));
+        state.set_foreign_rows(sample_foreign_rows("n1", "mini"));
 
         let foreign_ws_indices: Vec<usize> = state
             .workspaces
