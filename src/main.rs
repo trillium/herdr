@@ -415,6 +415,9 @@ pane_history = false
 # Cursor shape rendered when reveal_hidden_cursor_for_cjk_ime is true.
 # Values: block, steady_block (default), underline, steady_underline, bar, steady_bar.
 # cjk_ime_cursor_shape = "steady_block"
+# Reserved for fleet federation (aggregating remote herdr servers' agent
+# sessions into the local sidebar). Has no effect yet.
+# federation = false
 
 [advanced]
 # Maximum scrollback buffer size in bytes retained per pane terminal.
