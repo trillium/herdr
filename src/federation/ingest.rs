@@ -550,7 +550,7 @@ mod tests {
     #[test]
     fn sample_agent_only_snapshot_maps_faithfully() {
         // The real `herdr api snapshot` evidence: an agents-only capture.
-        let body = include_str!("../../.local/prd/sample-session-snapshot.json");
+        let body = include_str!("testdata/sample-session-snapshot.json");
         let rows = map(body, "n1", "mini");
 
         // Two agents in one workspace across two tabs.
