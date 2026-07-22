@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-07-22 — session 81a2baa0
+
+Files: src/main.rs
+## 2026-07-22 — session 8961491f
+
+Files: src/app/state.rs
 ## Unreleased
 
 ## [0.7.5] - 2026-07-21
