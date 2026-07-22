@@ -14,13 +14,20 @@ use super::origin::OriginKey;
 const FED_PREFIX: &str = "fed~";
 const SEP: char = '~';
 
+/// Namespace an arbitrary foreign public id with its origin: `fed~<key>~<raw>`.
+///
+/// The shared shape for every namespaced id. Terminal ids go through
+/// [`namespace_terminal_id`]; workspace ids (and, transitively, the tab/pane
+/// ids herdr derives from a workspace id) go through this string form. The
+/// origin key never contains the `~` separator, so the first `~` after the
+/// prefix always delimits it.
+pub fn namespace_public_id(origin: &OriginKey, raw: &str) -> String {
+    format!("{FED_PREFIX}{}{SEP}{}", origin.as_str(), raw)
+}
+
 /// Namespace a foreign terminal id with its origin: `fed~<key>~<raw>`.
 pub fn namespace_terminal_id(origin: &OriginKey, raw: &TerminalId) -> TerminalId {
-    TerminalId::from_string(format!(
-        "{FED_PREFIX}{}{SEP}{}",
-        origin.as_str(),
-        raw.as_str()
-    ))
+    TerminalId::from_string(namespace_public_id(origin, raw.as_str()))
 }
 
 /// Whether a terminal id is a well-formed namespaced foreign id.
@@ -63,6 +70,18 @@ mod tests {
         let (parsed_origin, parsed_raw) = parse_foreign_terminal_id(&foreign).unwrap();
         assert_eq!(parsed_origin, origin);
         assert_eq!(parsed_raw, raw);
+    }
+
+    #[test]
+    fn public_id_namespacer_shares_terminal_shape() {
+        let origin = OriginKey::new("n1").unwrap();
+        // The string namespacer and the terminal namespacer must agree so a
+        // namespaced workspace id and its terminal ids carry the same prefix.
+        assert_eq!(namespace_public_id(&origin, "w5"), "fed~n1~w5");
+        assert_eq!(
+            namespace_terminal_id(&origin, &TerminalId::from_string("term_1")).as_str(),
+            namespace_public_id(&origin, "term_1")
+        );
     }
 
     #[test]
