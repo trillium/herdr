@@ -20,6 +20,17 @@ impl TerminalId {
         let counter = NEXT_TERMINAL_ID.fetch_add(1, Ordering::Relaxed);
         Self(format!("term_{micros:x}{counter:x}"))
     }
+
+    /// Construct from an explicit string. For persistence and federation
+    /// id-namespacing only — callers must not derive this from a pane id or
+    /// layout position.
+    pub(crate) fn from_string(raw: impl Into<String>) -> Self {
+        Self(raw.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 impl fmt::Display for TerminalId {
