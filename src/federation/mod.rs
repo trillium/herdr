@@ -9,16 +9,17 @@
 //! logic never bakes in SSH — a future direct/mTLS transport must slot in
 //! without touching them.
 //!
-//! This module is phase **N0** (origin plumbing): pure, runtime-free value
-//! types, the origin registry, the discovery parser, and id-namespacing. None
-//! of it is wired into the server runtime yet — phase N1 splices origin-tagged
-//! rows into `AppState` and adds the `federation.*` JSON API methods. The
-//! module-level allows below cover that gap and are removed in N1.
-// N0 scaffolding: types/re-exports are exercised by unit tests but not yet
-// consumed by the runtime; the allows are removed when N1 wires this in.
+//! Phase **N1a** adds [`ingest`]: a pure, runtime-free mapper from a remote
+//! `session.snapshot` to origin-namespaced [`ingest::ForeignRows`]. It consumes
+//! the N0 origin types and id-namespacing but still does not touch the runtime —
+//! splicing rows into `AppState` and the `federation.*` JSON API methods are
+//! N1b+. The module-level allows below remain only for the still-unwired N0
+//! surface (discovery, the registry, and the foreign-id predicates/parsers);
+//! they shrink as later phases consume it.
 #![allow(dead_code, unused_imports)]
 
 mod discovery;
+mod ingest;
 mod namespace;
 mod origin;
 mod registry;
@@ -26,6 +27,9 @@ mod registry;
 pub use discovery::{
     discover, forwarded_socket_path, DiscoveryConfig, StaticOrigin, TailscaleStatus,
 };
-pub use namespace::{is_foreign, namespace_terminal_id, parse_foreign_terminal_id};
+pub use ingest::{foreign_rows, ForeignRows, IngestError, RemoteSnapshot};
+pub use namespace::{
+    is_foreign, namespace_public_id, namespace_terminal_id, parse_foreign_terminal_id,
+};
 pub use origin::{ConnectionTarget, InvalidOriginKey, Origin, OriginKey};
 pub use registry::{FederationRegistry, ReconcileDelta};

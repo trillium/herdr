@@ -1,0 +1,30 @@
+{
+  "result": {
+    "snapshot": {
+      "protocol": 16,
+      "version": "0.7.3",
+      "agents": [
+        {
+          "pane_id": "w1:p1",
+          "tab_id": "w1:t1",
+          "workspace_id": "w1",
+          "terminal_id": "term_1",
+          "agent": "claude",
+          "agent_status": "working",
+          "cwd": "/Users/trilliumsmith/code/firstmate",
+          "name": "firstmate-review"
+        },
+        {
+          "pane_id": "w1:p2",
+          "tab_id": "w1:t2",
+          "workspace_id": "w1",
+          "terminal_id": "term_2",
+          "agent": "claude",
+          "agent_status": "idle",
+          "cwd": "/Users/trilliumsmith/code/firstmate",
+          "name": "firstmate-docs"
+        }
+      ]
+    }
+  }
+}
