@@ -46,12 +46,10 @@ pub fn is_foreign(id: &TerminalId) -> bool {
 /// separator, so the first `~` after the prefix delimits it; anything after
 /// belongs to the remote's raw id verbatim.
 pub fn parse_foreign_terminal_id(id: &TerminalId) -> Option<(OriginKey, TerminalId)> {
-    let rest = id.as_str().strip_prefix(FED_PREFIX)?;
-    let (key, raw) = rest.split_once(SEP)?;
-    if raw.is_empty() {
-        return None;
-    }
-    Some((OriginKey::new(key).ok()?, TerminalId::from_string(raw)))
+    // Delegate to the string-form parser so the two foreign-id checks cannot
+    // silently diverge — this is a security-relevant shape validation.
+    let (key, raw) = parse_foreign_public_id(id.as_str())?;
+    Some((key, TerminalId::from_string(raw)))
 }
 
 /// Split a namespaced foreign public id (workspace/tab/pane) into `(origin, raw)`.

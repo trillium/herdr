@@ -1603,10 +1603,10 @@ impl AppState {
     /// removed first, then `rows` are appended after local state. Never mutates
     /// `active`, `selected`, or any local workspace/terminal. Read-only
     /// projection — foreign panes carry dead channels and receive no input.
-    //
-    // Only tests exercise this until N1c wires it into the runtime (the async
-    // poll loop, via the flag-gated seam), so the non-test build sees it unused.
-    #[allow(dead_code)]
+    ///
+    /// Driven at runtime by the config-reload path (to clear foreign rows when
+    /// `experimental.federation` is toggled off) and, from N1c, by the async
+    /// snapshot poll loop.
     pub fn set_foreign_rows(&mut self, rows: crate::federation::ForeignRows) {
         // Strip previously-injected foreign rows, keyed on the origin-namespace
         // predicate (never a raw string check) so repeated calls replace rather
