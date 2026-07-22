@@ -915,10 +915,13 @@ pub struct ExperimentalConfig {
     /// source when prefix mode exits. macOS only; a no-op elsewhere and a
     /// best-effort no-op if the switch fails. Default: false.
     pub switch_ascii_input_source_in_prefix: bool,
-    /// Reserved for fleet federation (aggregating remote herdr servers' agent
-    /// sessions into the local sidebar). Has NO effect yet: the federation
-    /// module is not wired into the runtime until N1b. Read-only when active.
-    /// Default: false. See `src/federation/`.
+    /// Fleet federation: aggregate remote herdr servers' agent sessions into
+    /// this session. When enabled, federated remote sessions are projected
+    /// read-only into the local session view (they render in the existing
+    /// sidebar but receive no input, PTY relay, or events). When disabled, any
+    /// previously projected remote state is cleared. Origin polling itself lands
+    /// in a later phase; today the flag gates the projection seam. Default:
+    /// false. See `src/federation/`.
     pub federation: bool,
 }
 

@@ -1119,7 +1119,7 @@
           "key": "experimental.federation",
           "type": "boolean",
           "default": "false",
-          "description": "Reserved for fleet federation (aggregating remote herdr servers' agent sessions into the local sidebar). Has no effect yet — not wired into the runtime until N1b. Read-only when active."
+          "description": "Fleet federation: aggregate remote herdr servers' agent sessions into this session. When enabled, federated remote sessions are projected read-only into the local session view — they render in the existing sidebar but receive no input, PTY relay, or events. When disabled, any previously projected remote state is cleared. Origin polling itself lands in a later phase; today the flag gates the projection seam."
         }
       ]
     }

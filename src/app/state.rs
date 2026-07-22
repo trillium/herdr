@@ -1527,6 +1527,11 @@ pub struct AppState {
     /// `[experimental] switch_ascii_input_source_in_prefix`.
     pub switch_ascii_input_source_in_prefix: bool,
     pub kitty_graphics_enabled: bool,
+    /// When enabled (`experimental.federation`), remote herdr servers' agent
+    /// sessions are projected read-only into this session via the federation
+    /// splice. The flag is consulted only by the gated seam
+    /// [`AppState::apply_foreign_rows`]; the splice itself is unconditional.
+    pub federation_enabled: bool,
     pub default_shell: String,
     pub shell_mode: crate::config::ShellModeConfig,
     pub new_terminal_cwd: NewTerminalCwdConfig,
@@ -1639,6 +1644,25 @@ impl AppState {
             foreign_terminals,
             "federation: spliced foreign rows into app state"
         );
+    }
+
+    /// Flag-gated entry point the N1c poll loop will drive. When
+    /// `experimental.federation` is enabled the foreign projection is replaced
+    /// with `rows`; when disabled `rows` is ignored and any existing foreign
+    /// rows are cleared, so a disabled build never carries remote state. This is
+    /// the only seam that consults the flag — [`AppState::set_foreign_rows`] is
+    /// unconditional by design.
+    //
+    // Wired into the async poll loop in N1c; until then only tests drive it, so
+    // the non-test build sees it unused.
+    #[allow(dead_code)]
+    pub fn apply_foreign_rows(&mut self, rows: crate::federation::ForeignRows) {
+        let rows = if self.federation_enabled {
+            rows
+        } else {
+            crate::federation::ForeignRows::empty()
+        };
+        self.set_foreign_rows(rows);
     }
 
     pub(crate) fn remove_alias_shadowed_by_new_pane(&mut self, pane_id: PaneId) {
@@ -1942,6 +1966,7 @@ impl AppState {
             cjk_ime_cursor_shape: 2, // steady_block
             switch_ascii_input_source_in_prefix: false,
             kitty_graphics_enabled: false,
+            federation_enabled: false,
             default_shell: String::new(),
             shell_mode: crate::config::ShellModeConfig::Auto,
             new_terminal_cwd: NewTerminalCwdConfig::Follow,
@@ -2595,6 +2620,51 @@ mod tests {
                 "sidebar must surface an entry for foreign workspace at index {ws_idx}"
             );
         }
+    }
+
+    #[test]
+    fn apply_foreign_rows_respects_federation_flag() {
+        // Flag off (default): the gated seam ignores foreign rows entirely and
+        // leaves local state untouched.
+        let mut state = AppState::test_with_adversarial_identity_state();
+        assert!(!state.federation_enabled, "federation defaults off");
+        let local_ws = state.workspaces.len();
+
+        state.apply_foreign_rows(sample_foreign_rows("n1", "mini"));
+        assert_eq!(
+            state.workspaces.len(),
+            local_ws,
+            "disabled flag must ignore incoming foreign rows"
+        );
+        assert!(
+            !state.workspaces.iter().any(is_foreign_workspace),
+            "disabled flag must not project foreign workspaces"
+        );
+        state.assert_invariants_for_test();
+
+        // Flag on: foreign rows project into the session.
+        state.federation_enabled = true;
+        state.apply_foreign_rows(sample_foreign_rows("n1", "mini"));
+        assert!(
+            state.workspaces.iter().any(is_foreign_workspace),
+            "enabled flag must project foreign rows"
+        );
+        state.assert_invariants_for_test();
+
+        // Flag flipped back off: existing foreign rows are cleared even though
+        // the incoming rows are non-empty.
+        state.federation_enabled = false;
+        state.apply_foreign_rows(sample_foreign_rows("n1", "mini"));
+        assert!(
+            !state.workspaces.iter().any(is_foreign_workspace),
+            "disabling the flag must clear existing foreign rows"
+        );
+        assert_eq!(
+            state.workspaces.len(),
+            local_ws,
+            "local workspaces restored when the flag is disabled"
+        );
+        state.assert_invariants_for_test();
     }
 
     fn navigator_row_for_display(is_workspace: bool) -> NavigatorRow {
