@@ -1119,7 +1119,7 @@
           "key": "experimental.federation",
           "type": "boolean",
           "default": "false",
-          "description": "Reserved for fleet federation (aggregating remote herdr servers' agent sessions into the local sidebar). Has no effect yet — not wired into the runtime until N1. Read-only when active."
+          "description": "Reserved for fleet federation (aggregating remote herdr servers' agent sessions into the local sidebar). Has no effect yet — not wired into the runtime until N1b. Read-only when active."
         }
       ]
     }
