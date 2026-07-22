@@ -1569,8 +1569,7 @@ mod tests {
         // Turn on the flag and project a remote server's sessions through the
         // gated seam the poll loop will drive.
         app.federation_enabled = true;
-        let body =
-            include_str!("../federation/testdata/sample-session-snapshot.json");
+        let body = include_str!("../federation/testdata/sample-session-snapshot.json");
         let snap = crate::federation::RemoteSnapshot::from_api_response(body)
             .expect("sample fixture parses");
         let origin = crate::federation::Origin::new(
