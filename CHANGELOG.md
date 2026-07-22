@@ -1,8 +1,5 @@
 # Changelog
 
-## 2026-07-22 — session e08b00c0
-
-Files: CHANGELOG.md
 ## Unreleased
 
 ## [0.7.5] - 2026-07-21
