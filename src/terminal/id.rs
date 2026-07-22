@@ -21,6 +21,13 @@ impl TerminalId {
         Self(format!("term_{micros:x}{counter:x}"))
     }
 
+    /// Construct from an explicit string. For persistence and federation
+    /// id-namespacing only — callers must not derive this from a pane id or
+    /// layout position.
+    pub(crate) fn from_string(raw: impl Into<String>) -> Self {
+        Self(raw.into())
+    }
+
     pub(crate) fn as_str(&self) -> &str {
         &self.0
     }

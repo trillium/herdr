@@ -1005,6 +1005,11 @@ pub struct ExperimentalConfig {
     /// elsewhere and a best-effort no-op if the switch fails.
     /// Default: false.
     pub switch_ascii_input_source_in_prefix: bool,
+    /// Reserved for fleet federation (aggregating remote herdr servers' agent
+    /// sessions into the local sidebar). Has NO effect yet: the federation
+    /// module is not wired into the runtime until N1. Read-only when active.
+    /// Default: false. See `src/federation/`.
+    pub federation: bool,
 }
 
 impl Default for KeysConfig {
@@ -1860,12 +1865,21 @@ allow_nested = true
 kitty_graphics = true
 pane_history = true
 switch_ascii_input_source_in_prefix = true
+federation = true
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert!(config.experimental.allow_nested);
         assert!(config.experimental.kitty_graphics);
         assert!(config.experimental.pane_history);
         assert!(config.experimental.switch_ascii_input_source_in_prefix);
+        assert!(config.experimental.federation);
+    }
+
+    #[test]
+    fn federation_defaults_off() {
+        assert!(!Config::default().experimental.federation);
+        let config: Config = toml::from_str("").unwrap();
+        assert!(!config.experimental.federation);
     }
 
     #[test]
