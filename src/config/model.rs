@@ -915,8 +915,10 @@ pub struct ExperimentalConfig {
     /// source when prefix mode exits. macOS only; a no-op elsewhere and a
     /// best-effort no-op if the switch fails. Default: false.
     pub switch_ascii_input_source_in_prefix: bool,
-    /// Aggregate remote herdr servers' agent sessions into the local sidebar
-    /// (fleet federation). Read-only. Default: false. See `src/federation/`.
+    /// Reserved for fleet federation (aggregating remote herdr servers' agent
+    /// sessions into the local sidebar). Has NO effect yet: the federation
+    /// module is not wired into the runtime until N1. Read-only when active.
+    /// Default: false. See `src/federation/`.
     pub federation: bool,
 }
 

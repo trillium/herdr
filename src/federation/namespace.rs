@@ -23,9 +23,13 @@ pub fn namespace_terminal_id(origin: &OriginKey, raw: &TerminalId) -> TerminalId
     ))
 }
 
-/// Whether a terminal id is a namespaced foreign id.
+/// Whether a terminal id is a well-formed namespaced foreign id.
+///
+/// Validates the full `fed~<key>~<raw>` shape via [`parse_foreign_terminal_id`],
+/// not just the prefix, so a malformed value like `fed~n1` (which fails parsing)
+/// is not treated as foreign by callers that check this before parsing.
 pub fn is_foreign(id: &TerminalId) -> bool {
-    id.as_str().starts_with(FED_PREFIX)
+    parse_foreign_terminal_id(id).is_some()
 }
 
 /// Split a namespaced foreign terminal id back into `(origin, raw)`.
@@ -78,10 +82,14 @@ mod tests {
 
     #[test]
     fn malformed_foreign_ids_reject() {
-        // Prefix present but missing separator / empty halves.
-        assert!(parse_foreign_terminal_id(&TerminalId::from_string("fed~n1")).is_none());
-        assert!(parse_foreign_terminal_id(&TerminalId::from_string("fed~~raw")).is_none());
-        assert!(parse_foreign_terminal_id(&TerminalId::from_string("fed~n1~")).is_none());
+        // Prefix present but missing separator / empty halves. Both the parser
+        // and the is_foreign predicate must reject these — a bare `fed~` prefix
+        // is not enough to call an id foreign.
+        for malformed in ["fed~n1", "fed~~raw", "fed~n1~"] {
+            let id = TerminalId::from_string(malformed);
+            assert!(parse_foreign_terminal_id(&id).is_none(), "{malformed}");
+            assert!(!is_foreign(&id), "{malformed}");
+        }
     }
 
     #[test]
