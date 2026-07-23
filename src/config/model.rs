@@ -1006,12 +1006,14 @@ pub struct ExperimentalConfig {
     /// Default: false.
     pub switch_ascii_input_source_in_prefix: bool,
     /// Fleet federation: aggregate remote herdr servers' agent sessions into
-    /// this session. When enabled, federated remote sessions are projected
-    /// read-only into the local session view (they render in the existing
-    /// sidebar but receive no input, PTY relay, or events). When disabled, any
-    /// previously projected remote state is cleared. Origin polling itself lands
-    /// in a later phase; today the flag gates the projection seam. Default:
-    /// false. See `src/federation/`.
+    /// this session. When enabled at startup, a background poll discovers remote
+    /// herdr servers (online Tailscale peers and static env overrides via
+    /// `HERDR_FEDERATION_ORIGINS`), polls each origin's snapshot every ~5
+    /// seconds, and projects aggregated remote sessions read-only into the
+    /// sidebar. Remote panes receive no input or PTY relay. Runtime toggle has
+    /// immediate-disable / deferred-enable semantics: disabling stops polling
+    /// immediately; enabling takes effect at the next launch. Default: false.
+    /// See `src/federation/`.
     pub federation: bool,
 }
 

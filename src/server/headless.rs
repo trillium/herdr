@@ -127,6 +127,7 @@ enum LoopEvent {
     Api(Box<api::ApiRequestMessage>),
     ServerEvent(ServerEvent),
     RenderRequested,
+    ForeignRows(crate::federation::ForeignRows),
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
@@ -553,6 +554,12 @@ impl HeadlessServer {
         // We use None for input_rx so the event loop doesn't try to read from stdin.
         self.app.input_rx = None;
 
+        // Federation snapshot poll runs in the server-owned runtime, not just the
+        // direct-TUI path. Without this the experimental.federation projection
+        // never starts under the headless server (the production runtime), so
+        // foreign rows are never ingested or drained below. See robots-5gu.
+        self.app.start_federation_poll_if_enabled();
+
         let mut needs_render = true;
         let mut needs_full_render = true;
         let mut needs_graphics_render = false;
@@ -811,6 +818,13 @@ impl HeadlessServer {
                         Some(ev) => LoopEvent::ServerEvent(ev),
                         None => LoopEvent::Timer,
                     },
+                    maybe_rows = self.app.foreign_rows_rx.recv() => match maybe_rows {
+                        // The app holds a live `foreign_rows_tx`, so the channel
+                        // never fully closes: `None` cannot occur and, with no
+                        // poll task, this branch simply pends.
+                        Some(rows) => LoopEvent::ForeignRows(rows),
+                        None => LoopEvent::Timer,
+                    },
                     _ = sleep_until_or_pending(next_deadline) => LoopEvent::Timer,
                     _ = self.app.render_notify.notified() => LoopEvent::RenderRequested,
                 }
@@ -890,6 +904,15 @@ impl HeadlessServer {
                     if self.app.render_dirty.is_pending() {
                         needs_render = true;
                     }
+                }
+                LoopEvent::ForeignRows(rows) => {
+                    // `apply_foreign_rows` is the flag-gated seam: it projects the
+                    // rows when federation is enabled and clears them (ignoring
+                    // `rows`) when it is not, so a tick that races a disable is a
+                    // safe no-op.
+                    self.app.state.apply_foreign_rows(rows);
+                    needs_render = true;
+                    needs_full_render = true;
                 }
             }
         }
@@ -10441,6 +10464,53 @@ next_tab = ""
                 .recv_timeout(Duration::from_millis(50))
                 .is_err(),
             "bells without a foreground client must not be retained"
+        );
+    }
+
+    #[test]
+    fn headless_runtime_projects_channel_delivered_foreign_rows() {
+        // Regression guard for robots-5gu: the experimental.federation poll and
+        // its channel drain must live on the headless (production) runtime, not
+        // only the direct-TUI path. Build the real server the headless runtime
+        // owns, deliver a poll tick on the same `foreign_rows_tx` the poll task
+        // uses, drain it exactly as the run loop's select! branch does, and
+        // apply it through the exact call the new `LoopEvent::ForeignRows` arm
+        // makes — asserting the foreign workspace projects into server state.
+        let mut server = test_headless_server();
+        server.app.state.federation_enabled = true;
+
+        let body = include_str!("../federation/testdata/sample-session-snapshot.json");
+        let snap = crate::federation::RemoteSnapshot::from_api_response(body)
+            .expect("sample fixture parses");
+        let origin = crate::federation::Origin::new(
+            crate::federation::OriginKey::new("mini1").expect("valid origin key"),
+            "mini1",
+            crate::federation::ConnectionTarget::LocalSocket(std::path::PathBuf::from(
+                "/tmp/fed-headless-test.sock",
+            )),
+        );
+        let rows = crate::federation::foreign_rows(&origin, &snap);
+
+        server
+            .app
+            .foreign_rows_tx
+            .try_send(rows)
+            .expect("foreign rows channel has capacity");
+        let delivered = server
+            .app
+            .foreign_rows_rx
+            .try_recv()
+            .expect("a foreign rows tick is queued");
+        server.app.state.apply_foreign_rows(delivered);
+
+        assert!(
+            server
+                .app
+                .state
+                .workspaces
+                .iter()
+                .any(|ws| crate::federation::is_foreign_workspace_id(&ws.id)),
+            "headless runtime projects channel-delivered foreign rows into state"
         );
     }
 

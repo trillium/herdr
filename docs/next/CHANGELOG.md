@@ -117,6 +117,9 @@
 - Clients restore terminal state when they receive SIGHUP or SIGTERM. (#2041, thanks @MattJColes)
 - Windows now shows `system` notifications and completes MP3 notification sounds without leaving PowerShell players waiting for a timeout. (#1330)
 
+### Fixed
+- Fleet federation now runs under the headless server, the production runtime. The `experimental.federation` snapshot poll and its foreign-rows channel were previously wired only into the legacy direct-TUI path, so remote sessions never appeared in normal `herdr` sessions; the poll now starts and its ticks are projected under the headless server.
+
 ## [0.7.5] - 2026-07-21
 
 ### Breaking Changes
