@@ -15,10 +15,13 @@
 //! **N1b** splices those rows into `AppState` (`set_foreign_rows` /
 //! `apply_foreign_rows`), gated behind `experimental.federation` (default off)
 //! and projected read-only — foreign panes carry dead channels and receive no
-//! input or PTY relay. The async snapshot poll loop that drives the projection
-//! and the `federation.*` JSON API methods are later phases (N1c+). The
-//! module-level allows below remain only for the still-unwired N0 surface
-//! (discovery and the registry); they shrink as later phases consume it.
+//! input or PTY relay. Phase **N1c** delivers the async snapshot poll loop
+//! ([`poll::collect_foreign_rows`] spawned in `App::spawn_federation_poll`) that
+//! fetches each remote origin's snapshot on a ~5s timer when the flag is enabled
+//! at startup and projects it live into the sidebar. The `federation.*` JSON API
+//! methods are a later phase (N1d+). The module-level allows below remain only
+//! for the still-unwired N0 surface (registry); they shrink as later phases
+//! consume it.
 #![allow(dead_code, unused_imports)]
 
 mod discovery;

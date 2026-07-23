@@ -1119,7 +1119,7 @@
           "key": "experimental.federation",
           "type": "boolean",
           "default": "false",
-          "description": "Fleet federation: aggregate remote herdr servers' agent sessions into this session. When enabled, federated remote sessions are projected read-only into the local session view — they render in the existing sidebar but receive no input, PTY relay, or events. When disabled, any previously projected remote state is cleared. Origin polling itself lands in a later phase; today the flag gates the projection seam."
+          "description": "Fleet federation: aggregate remote herdr servers' agent sessions into this session. When enabled at startup, a background task discovers federated origins (online Tailscale peers and static env overrides) and polls each origin's snapshot every ~5 seconds, projecting the aggregated remote sessions read-only into the local sidebar — no input, PTY relay, or events. When disabled, any previously projected remote state is cleared and no federation network I/O occurs. Runtime toggle: disabled-to-enabled defers polling to next launch; enabled-to-disabled stops polling immediately and clears foreign state."
         }
       ]
     }
