@@ -6,6 +6,9 @@
 - Fleet federation phase N1c: Background snapshot poll for federated origins. When `experimental.federation = true` at startup, Herdr discovers remote herdr servers (online Tailscale peers and static env overrides via `HERDR_FEDERATION_ORIGINS`), polls each origin's snapshot every ~5 seconds, and projects aggregated remote sessions read-only into the sidebar. Remote panes receive no input or PTY relay. Runtime toggle has immediate-disable / deferred-enable semantics: disabling at runtime stops polling immediately; enabling takes effect at the next launch. Uses `tokio::select!` with `spawn_blocking` for synchronous snapshot fetches.
 - Focus identity hardening (N1b scope): `AppState::set_foreign_rows` now captures and re-resolves workspace focus by identity after foreign splice, so persisted foreign focus follows its workspace and removed-workspace focus falls back to valid local state in release builds.
 
+### Fixed
+- Fleet federation now runs under the headless server, the production runtime. The `experimental.federation` snapshot poll and its foreign-rows channel were previously wired only into the legacy direct-TUI path, so remote sessions never appeared in normal `herdr` sessions; the poll now starts and its ticks are projected under the headless server.
+
 ## [0.7.5] - 2026-07-21
 
 ### Breaking Changes
