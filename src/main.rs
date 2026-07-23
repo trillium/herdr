@@ -416,11 +416,13 @@ pane_history = false
 # Values: block, steady_block (default), underline, steady_underline, bar, steady_bar.
 # cjk_ime_cursor_shape = "steady_block"
 # Fleet federation: aggregate remote herdr servers' agent sessions into this
-# session. When enabled, federated remote sessions are projected read-only into
-# the local session view (they render in the existing sidebar but receive no
-# input, PTY relay, or events). When disabled, any previously projected remote
-# state is cleared. Origin polling itself lands in a later phase; today the flag
-# gates the projection seam.
+# session. When enabled at startup, a background poll discovers remote herdr
+# servers (online Tailscale peers and static env overrides via
+# HERDR_FEDERATION_ORIGINS), polls each origin's snapshot every ~5 seconds, and
+# projects aggregated remote sessions read-only into the sidebar. Remote panes
+# receive no input or PTY relay. Runtime toggle has immediate-disable / deferred-
+# enable semantics: disabling stops polling immediately; enabling takes effect at
+# the next launch.
 # federation = false
 
 [advanced]
