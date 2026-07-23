@@ -25,6 +25,7 @@ mod discovery;
 mod ingest;
 mod namespace;
 mod origin;
+mod poll;
 mod registry;
 
 pub use discovery::{
@@ -36,4 +37,5 @@ pub use namespace::{
     parse_foreign_terminal_id,
 };
 pub use origin::{ConnectionTarget, InvalidOriginKey, Origin, OriginKey};
+pub use poll::collect_foreign_rows;
 pub use registry::{FederationRegistry, ReconcileDelta};
