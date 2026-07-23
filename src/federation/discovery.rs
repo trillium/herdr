@@ -9,6 +9,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use serde::Deserialize;
 
@@ -213,32 +214,89 @@ pub fn discovery_config_from_env() -> DiscoveryConfig {
     }
 }
 
-/// Run `tailscale status --json` at the process edge, returning the parsed
-/// status or `None` when tailscale is absent, exits non-zero, or produces
-/// unparseable output. Self-healing: any failure degrades to "no tailnet peers"
-/// rather than an error, so federation still works from static overrides alone.
-pub fn tailscale_status() -> Option<TailscaleStatus> {
-    let output = match Command::new("tailscale")
-        .args(["status", "--json"])
-        .output()
-    {
-        Ok(output) if output.status.success() => output,
-        Ok(output) => {
-            tracing::debug!(
-                status = ?output.status,
-                "federation discovery: `tailscale status` exited non-zero; no tailnet peers"
-            );
-            return None;
-        }
+/// Deadline for the one-shot `tailscale status --json` discovery probe. A hung
+/// `tailscaled` must not stall the federation poll task from reaching its static
+/// origins.
+const TAILSCALE_STATUS_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Run `command` to completion, but no longer than `timeout`. Returns the
+/// captured stdout bytes on a successful (zero-exit) completion; returns `None`
+/// on timeout (after killing+reaping the child), non-zero exit, or any spawn/IO
+/// error. `label` is used only for logging.
+fn output_within(command: &mut Command, timeout: Duration, label: &str) -> Option<Vec<u8>> {
+    use std::io::Read;
+    use std::process::Stdio;
+    use std::time::Instant;
+
+    let mut child = match command.stdout(Stdio::piped()).stderr(Stdio::null()).spawn() {
+        Ok(child) => child,
         Err(err) => {
-            tracing::debug!(
-                %err,
-                "federation discovery: `tailscale status` unavailable; no tailnet peers"
-            );
+            tracing::debug!(%err, command = label, "federation discovery: subprocess unavailable");
             return None;
         }
     };
-    match serde_json::from_slice::<TailscaleStatus>(&output.stdout) {
+
+    // Drain stdout concurrently so a large payload cannot fill the pipe buffer
+    // and block the child from exiting while we poll try_wait.
+    let stdout = child.stdout.take();
+    let reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut out) = stdout {
+            let _ = out.read_to_end(&mut buf);
+        }
+        buf
+    });
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = reader.join();
+                    tracing::debug!(
+                        command = label,
+                        "federation discovery: subprocess timed out; no tailnet peers"
+                    );
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(err) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = reader.join();
+                tracing::debug!(%err, command = label, "federation discovery: subprocess wait failed");
+                return None;
+            }
+        }
+    };
+
+    let stdout_bytes = reader.join().unwrap_or_default();
+    if !status.success() {
+        tracing::debug!(
+            ?status,
+            command = label,
+            "federation discovery: subprocess exited non-zero; no tailnet peers"
+        );
+        return None;
+    }
+    Some(stdout_bytes)
+}
+
+/// Run `tailscale status --json` at the process edge, returning the parsed
+/// status or `None` when tailscale is absent, exits non-zero, times out, or
+/// produces unparseable output. Self-healing: any failure degrades to "no
+/// tailnet peers" rather than an error, so federation still works from static
+/// overrides alone. The subprocess is bounded by [`TAILSCALE_STATUS_TIMEOUT`] so
+/// a wedged `tailscaled` cannot stall the poll task from reaching static origins.
+pub fn tailscale_status() -> Option<TailscaleStatus> {
+    let mut command = Command::new("tailscale");
+    command.args(["status", "--json"]);
+    let stdout = output_within(&mut command, TAILSCALE_STATUS_TIMEOUT, "tailscale status")?;
+    match serde_json::from_slice::<TailscaleStatus>(&stdout) {
         Ok(status) => Some(status),
         Err(err) => {
             tracing::warn!(
@@ -437,5 +495,45 @@ mod tests {
     fn parse_static_origins_empty_string_yields_none() {
         assert!(parse_static_origins("").is_empty());
         assert!(parse_static_origins("  ;  ; ").is_empty());
+    }
+
+    // The timeout helper shells out to `sh`, so these are Unix-only.
+    #[cfg(unix)]
+    mod output_within_tests {
+        use super::super::output_within;
+        use std::process::Command;
+        use std::time::{Duration, Instant};
+
+        #[test]
+        fn returns_none_promptly_when_the_subprocess_exceeds_the_deadline() {
+            // A 5s sleep bounded by a 200ms deadline must be killed and reaped
+            // well before the sleep would finish — proving we did not wait it out.
+            let mut command = Command::new("sh");
+            command.args(["-c", "sleep 5"]);
+            let started = Instant::now();
+            let out = output_within(&mut command, Duration::from_millis(200), "sleep");
+            let elapsed = started.elapsed();
+            assert!(out.is_none(), "timed-out subprocess yields None");
+            assert!(
+                elapsed < Duration::from_secs(1),
+                "returned in {elapsed:?}, should be well under the 5s sleep"
+            );
+        }
+
+        #[test]
+        fn returns_stdout_bytes_on_successful_completion() {
+            let mut command = Command::new("sh");
+            command.args(["-c", "printf hello"]);
+            let out = output_within(&mut command, Duration::from_secs(2), "printf");
+            assert_eq!(out, Some(b"hello".to_vec()));
+        }
+
+        #[test]
+        fn returns_none_on_non_zero_exit() {
+            let mut command = Command::new("sh");
+            command.args(["-c", "exit 3"]);
+            let out = output_within(&mut command, Duration::from_secs(2), "exit3");
+            assert!(out.is_none(), "non-zero exit yields None");
+        }
     }
 }
