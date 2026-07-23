@@ -29,7 +29,8 @@ mod poll;
 mod registry;
 
 pub use discovery::{
-    discover, forwarded_socket_path, DiscoveryConfig, StaticOrigin, TailscaleStatus,
+    discover, discover_origins, forwarded_socket_path, DiscoveryConfig, StaticOrigin,
+    TailscaleStatus,
 };
 pub use ingest::{foreign_rows, ForeignRows, IngestError, RemoteSnapshot};
 pub use namespace::{
