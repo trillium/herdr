@@ -2682,6 +2682,90 @@ mod tests {
     }
 
     #[test]
+    fn poll_channel_projects_foreign_rows_when_enabled_and_noops_when_disabled() {
+        // Exercises the N1c live poll application path end to end without a real
+        // socket: a poll tick's `ForeignRows` is delivered on the same channel
+        // the poll task uses, drained exactly as the run loop's select! branch
+        // does (`recv` -> `apply_foreign_rows`), and the projection is asserted
+        // to reach the sidebar. With the flag off the same delivery is a no-op.
+        let mut config = Config::default();
+        config.experimental.federation = true;
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(&config, true, None, api_rx, crate::api::EventHub::default());
+        assert!(app.state.federation_enabled, "flag on at construction");
+
+        let tick_rows = || {
+            let body = include_str!("../federation/testdata/sample-session-snapshot.json");
+            let snap = crate::federation::RemoteSnapshot::from_api_response(body)
+                .expect("sample fixture parses");
+            let origin = crate::federation::Origin::new(
+                crate::federation::OriginKey::new("mini1").expect("valid origin key"),
+                "mini1",
+                crate::federation::ConnectionTarget::LocalSocket(std::path::PathBuf::from(
+                    "/tmp/fed-poll-channel-test.sock",
+                )),
+            );
+            crate::federation::foreign_rows(&origin, &snap)
+        };
+
+        // Enabled: deliver a tick on the channel, drain + apply as the run loop
+        // does, and assert the foreign rows reach both app state and the sidebar.
+        app.foreign_rows_tx
+            .try_send(tick_rows())
+            .expect("foreign rows channel has capacity");
+        let delivered = app
+            .foreign_rows_rx
+            .try_recv()
+            .expect("a foreign rows tick is queued");
+        app.state.apply_foreign_rows(delivered);
+
+        assert!(
+            app.state
+                .workspaces
+                .iter()
+                .any(|ws| crate::federation::is_foreign_workspace_id(&ws.id)),
+            "foreign rows projected into state when enabled"
+        );
+        let entries = crate::ui::all_agent_panel_entries(&app.state);
+        assert!(
+            entries.iter().any(|entry| app
+                .state
+                .workspaces
+                .get(entry.ws_idx)
+                .is_some_and(|ws| crate::federation::is_foreign_workspace_id(&ws.id))),
+            "sidebar surfaces a foreign entry when enabled"
+        );
+
+        // Disabled: the same channel delivery must clear rather than project —
+        // apply_foreign_rows is the only flag-gated seam, so a tick that races a
+        // disable is a safe no-op.
+        app.state.federation_enabled = false;
+        app.foreign_rows_tx
+            .try_send(tick_rows())
+            .expect("foreign rows channel has capacity");
+        let delivered = app
+            .foreign_rows_rx
+            .try_recv()
+            .expect("a foreign rows tick is queued");
+        app.state.apply_foreign_rows(delivered);
+
+        assert!(
+            !app.state
+                .workspaces
+                .iter()
+                .any(|ws| crate::federation::is_foreign_workspace_id(&ws.id)),
+            "disabled flag makes the channel-delivered rows a no-op"
+        );
+        assert!(
+            !app.state
+                .terminals
+                .keys()
+                .any(|id| crate::federation::parse_foreign_terminal_id(id).is_some()),
+            "disabled flag leaves no foreign terminals"
+        );
+    }
+
+    #[test]
     fn inferred_background_appearance_does_not_override_explicit_report() {
         let mut config = Config::default();
         config.theme.name = Some("catppuccin".to_string());
