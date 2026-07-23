@@ -11,11 +11,14 @@
 //!
 //! Phase **N1a** adds [`ingest`]: a pure, runtime-free mapper from a remote
 //! `session.snapshot` to origin-namespaced [`ingest::ForeignRows`]. It consumes
-//! the N0 origin types and id-namespacing but still does not touch the runtime —
-//! splicing rows into `AppState` and the `federation.*` JSON API methods are
-//! N1b+. The module-level allows below remain only for the still-unwired N0
-//! surface (discovery, the registry, and the foreign-id predicates/parsers);
-//! they shrink as later phases consume it.
+//! the N0 origin types and id-namespacing without touching the runtime. Phase
+//! **N1b** splices those rows into `AppState` (`set_foreign_rows` /
+//! `apply_foreign_rows`), gated behind `experimental.federation` (default off)
+//! and projected read-only — foreign panes carry dead channels and receive no
+//! input or PTY relay. The async snapshot poll loop that drives the projection
+//! and the `federation.*` JSON API methods are later phases (N1c+). The
+//! module-level allows below remain only for the still-unwired N0 surface
+//! (discovery and the registry); they shrink as later phases consume it.
 #![allow(dead_code, unused_imports)]
 
 mod discovery;
@@ -29,7 +32,8 @@ pub use discovery::{
 };
 pub use ingest::{foreign_rows, ForeignRows, IngestError, RemoteSnapshot};
 pub use namespace::{
-    is_foreign, namespace_public_id, namespace_terminal_id, parse_foreign_terminal_id,
+    is_foreign, is_foreign_workspace_id, namespace_public_id, namespace_terminal_id,
+    parse_foreign_terminal_id,
 };
 pub use origin::{ConnectionTarget, InvalidOriginKey, Origin, OriginKey};
 pub use registry::{FederationRegistry, ReconcileDelta};

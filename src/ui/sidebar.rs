@@ -1687,6 +1687,102 @@ mod tests {
         assert_eq!(agent_style.bg, Some(app.palette.surface_dim));
     }
 
+    // Evidence: a local session with `experimental.federation` on renders the
+    // remote server's agent sessions read-only in the existing sidebar, after
+    // the local rows, with no new render branch. Dumps the rendered sidebar so a
+    // reviewer can see the projected foreign entries the way an end user would.
+    #[test]
+    fn federation_foreign_sessions_render_in_sidebar_evidence() {
+        // A realistic local session: one workspace with a working Claude agent.
+        let mut app = crate::app::state::AppState::test_new();
+        let workspace = Workspace::test_new("local-work");
+        let pane_id = workspace.tabs[0].root_pane;
+        app.workspaces = vec![workspace];
+        app.ensure_test_terminals();
+        app.active = Some(0);
+        app.selected = 0;
+        let local_terminal_id = app.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        {
+            let ts = app.terminals.get_mut(&local_terminal_id).unwrap();
+            ts.detected_agent = Some(Agent::Claude);
+            ts.state = AgentState::Working;
+        }
+
+        // Turn on the flag and project a remote server's sessions through the
+        // gated seam the poll loop will drive.
+        app.federation_enabled = true;
+        let body = include_str!("../federation/testdata/sample-session-snapshot.json");
+        let snap = crate::federation::RemoteSnapshot::from_api_response(body)
+            .expect("sample fixture parses");
+        let origin = crate::federation::Origin::new(
+            crate::federation::OriginKey::new("mini1").expect("valid origin key"),
+            "mini1",
+            crate::federation::ConnectionTarget::LocalSocket(std::path::PathBuf::from(
+                "/tmp/fed-sidebar-evidence.sock",
+            )),
+        );
+        app.apply_foreign_rows(crate::federation::foreign_rows(&origin, &snap));
+
+        // Render the real sidebar exactly as the app draws it.
+        let (w, h) = (34u16, 24u16);
+        let area = Rect::new(0, 0, w, h);
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        terminal
+            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+
+        let rendered: Vec<String> = (0..h).map(|y| row_text(buffer, y, w)).collect();
+        println!("\n===== RENDERED HERDR SIDEBAR (experimental.federation = ON) =====");
+        for line in &rendered {
+            println!("│{line}");
+        }
+        println!("================================================================\n");
+
+        let full = rendered.join("\n");
+        // The remote server's two agent sessions surface in the sidebar.
+        assert!(
+            full.contains("firstmate-review"),
+            "remote working session must render in sidebar; got:\n{full}"
+        );
+        assert!(
+            full.contains("firstmate-docs"),
+            "remote idle session must render in sidebar; got:\n{full}"
+        );
+        // And the local session is still there, ahead of the foreign rows.
+        assert!(
+            full.contains("local-work"),
+            "local session must remain in sidebar; got:\n{full}"
+        );
+
+        // Now prove read-only teardown: flip the flag off and re-render — the
+        // remote rows vanish while the local session is untouched.
+        app.federation_enabled = false;
+        app.apply_foreign_rows(crate::federation::foreign_rows(&origin, &snap));
+        let mut terminal2 = Terminal::new(TestBackend::new(w, h)).unwrap();
+        terminal2
+            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area))
+            .unwrap();
+        let buffer2 = terminal2.backend().buffer();
+        let rendered_off: Vec<String> = (0..h).map(|y| row_text(buffer2, y, w)).collect();
+        println!("===== RENDERED HERDR SIDEBAR (experimental.federation = OFF) =====");
+        for line in &rendered_off {
+            println!("│{line}");
+        }
+        println!("=================================================================\n");
+        let full_off = rendered_off.join("\n");
+        assert!(
+            !full_off.contains("firstmate-review") && !full_off.contains("firstmate-docs"),
+            "disabling federation must clear remote rows from the sidebar; got:\n{full_off}"
+        );
+        assert!(
+            full_off.contains("local-work"),
+            "local session must survive federation teardown; got:\n{full_off}"
+        );
+    }
+
     #[test]
     fn occurrence_false_removes_default_workspace_bold_and_agent_dim() {
         let config: crate::config::Config = toml::from_str(

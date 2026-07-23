@@ -456,8 +456,12 @@ pane_history = false
 # Cursor shape rendered when reveal_hidden_cursor_for_cjk_ime is true.
 # Values: block, steady_block (default), underline, steady_underline, bar, steady_bar.
 # cjk_ime_cursor_shape = "steady_block"
-# Reserved for fleet federation (aggregating remote herdr servers' agent
-# sessions into the local sidebar). Has no effect yet.
+# Fleet federation: aggregate remote herdr servers' agent sessions into this
+# session. When enabled, federated remote sessions are projected read-only into
+# the local session view (they render in the existing sidebar but receive no
+# input, PTY relay, or events). When disabled, any previously projected remote
+# state is cleared. Origin polling itself lands in a later phase; today the flag
+# gates the projection seam.
 # federation = false
 
 [advanced]

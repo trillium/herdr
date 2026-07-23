@@ -661,6 +661,7 @@ impl App {
                 .experimental
                 .switch_ascii_input_source_in_prefix,
             kitty_graphics_enabled: config.experimental.kitty_graphics,
+            federation_enabled: config.experimental.federation,
             default_shell: config.terminal.default_shell.clone(),
             shell_mode: config.terminal.shell_mode,
             new_terminal_cwd: config.terminal.new_cwd.clone(),
@@ -1535,6 +1536,15 @@ impl App {
             self.state.pane_history_persistence = config.experimental.pane_history;
             if !self.persist_pane_history {
                 crate::persist::clear_history();
+            }
+            let was_federation_enabled = self.state.federation_enabled;
+            self.state.federation_enabled = config.experimental.federation;
+            if was_federation_enabled && !config.experimental.federation {
+                // Toggled off at runtime: drop any projected foreign rows so a
+                // disabled build never keeps remote state, mirroring the
+                // kitty-graphics teardown above.
+                self.state
+                    .set_foreign_rows(crate::federation::ForeignRows::empty());
             }
         }
 
@@ -2835,6 +2845,58 @@ mod tests {
         assert_eq!(
             app.state.palette.accent,
             ratatui::style::Color::Rgb(1, 2, 3)
+        );
+    }
+
+    #[test]
+    fn reload_disabling_federation_clears_projected_foreign_rows() {
+        // Drives the real reload path (apply_live_config) to prove that toggling
+        // experimental.federation off at runtime syncs AppState.federation_enabled
+        // and tears down any projected foreign rows — the reload sync CodeRabbit
+        // flagged as missing next to the sibling experimental flags.
+        let mut config = Config::default();
+        config.experimental.federation = true;
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(&config, true, None, api_rx, crate::api::EventHub::default());
+        assert!(app.state.federation_enabled, "flag on at construction");
+
+        let body = include_str!("../federation/testdata/sample-session-snapshot.json");
+        let snap = crate::federation::RemoteSnapshot::from_api_response(body)
+            .expect("sample fixture parses");
+        let origin = crate::federation::Origin::new(
+            crate::federation::OriginKey::new("mini1").expect("valid origin key"),
+            "mini1",
+            crate::federation::ConnectionTarget::LocalSocket(std::path::PathBuf::from(
+                "/tmp/fed-reload-test.sock",
+            )),
+        );
+        app.state
+            .set_foreign_rows(crate::federation::foreign_rows(&origin, &snap));
+        assert!(
+            app.state
+                .workspaces
+                .iter()
+                .any(|ws| crate::federation::is_foreign_workspace_id(&ws.id)),
+            "foreign rows present before disable"
+        );
+
+        let disabled = Config::default(); // experimental.federation defaults off
+        app.apply_live_config(&disabled, &[], &[], false);
+
+        assert!(!app.state.federation_enabled, "flag synced off on reload");
+        assert!(
+            !app.state
+                .workspaces
+                .iter()
+                .any(|ws| crate::federation::is_foreign_workspace_id(&ws.id)),
+            "foreign workspaces cleared on disable"
+        );
+        assert!(
+            !app.state
+                .terminals
+                .keys()
+                .any(|id| crate::federation::parse_foreign_terminal_id(id).is_some()),
+            "foreign terminals cleared on disable"
         );
     }
 
