@@ -73,27 +73,66 @@ pub fn collect_foreign_rows(origins: &[Origin], timeout: Duration) -> ForeignRow
     collect_with_fetcher(origins, timeout, fetch_snapshot_body)
 }
 
+/// Upper bound on simultaneously-inflight origin fetches. Federation fans out one
+/// scoped thread per origin within a chunk of this size, so a large fleet cannot
+/// spawn unbounded threads while still collapsing worst-case tick latency from
+/// N serial per-origin timeouts down to roughly one timeout per bounded batch.
+const MAX_POLL_CONCURRENCY: usize = 8;
+
 /// The mapping/aggregation core, parameterized over the snapshot fetcher so the
 /// pure mapping is unit-testable without real socket I/O. Production uses
 /// [`fetch_snapshot_body`]; tests inject a fixture-backed fetcher.
+///
+/// Origins are fetched with bounded concurrency (chunks of
+/// [`MAX_POLL_CONCURRENCY`], one scoped thread each), so a hung origin no longer
+/// serializes the timeout of every origin behind it. Results are joined in origin
+/// order, so the combined projection is deterministic regardless of which origins
+/// respond first; the per-origin warn-and-skip on failure is preserved.
 fn collect_with_fetcher<F>(origins: &[Origin], timeout: Duration, fetch: F) -> ForeignRows
 where
-    F: Fn(&Origin, Duration) -> Result<String, PollError>,
+    F: Fn(&Origin, Duration) -> Result<String, PollError> + Sync,
 {
     let mut combined = ForeignRows::empty();
-    for origin in origins {
-        match fetch(origin, timeout).and_then(|body| map_snapshot_body(origin, &body)) {
-            Ok(rows) => {
-                combined.workspaces.extend(rows.workspaces);
-                combined.terminals.extend(rows.terminals);
-            }
-            Err(err) => {
-                tracing::warn!(
-                    origin = %origin.key,
-                    label = %origin.label,
-                    error = %err,
-                    "federation poll: skipping origin for this tick"
-                );
+    for chunk in origins.chunks(MAX_POLL_CONCURRENCY) {
+        // One scoped thread per origin in the chunk; join in origin order. Scoped
+        // threads borrow `fetch` and each `origin` directly, so no cloning or
+        // 'static bound is needed. `join` only errs if the thread panicked.
+        let results: Vec<std::thread::Result<Result<ForeignRows, PollError>>> =
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = chunk
+                    .iter()
+                    .map(|origin| {
+                        let fetch = &fetch;
+                        scope.spawn(move || {
+                            fetch(origin, timeout).and_then(|body| map_snapshot_body(origin, &body))
+                        })
+                    })
+                    .collect();
+                handles.into_iter().map(|handle| handle.join()).collect()
+            });
+
+        for (origin, result) in chunk.iter().zip(results) {
+            match result {
+                Ok(Ok(rows)) => {
+                    combined.workspaces.extend(rows.workspaces);
+                    combined.terminals.extend(rows.terminals);
+                }
+                Ok(Err(err)) => {
+                    tracing::warn!(
+                        origin = %origin.key,
+                        label = %origin.label,
+                        error = %err,
+                        "federation poll: skipping origin for this tick"
+                    );
+                }
+                Err(_panic) => {
+                    tracing::warn!(
+                        origin = %origin.key,
+                        label = %origin.label,
+                        error = "origin fetch thread panicked",
+                        "federation poll: skipping origin for this tick"
+                    );
+                }
             }
         }
     }
@@ -210,6 +249,33 @@ mod tests {
             term_ids.len(),
             4,
             "terminal ids are disjoint across origins"
+        );
+    }
+
+    #[test]
+    fn combined_rows_preserve_origin_order_across_chunks() {
+        // Ten origins (more than MAX_POLL_CONCURRENCY, so this crosses a chunk
+        // boundary) each map the sample snapshot to a single workspace namespaced
+        // `fed~<key>~w1`. Concurrency must not reorder the projection: the
+        // combined workspaces must come out in origin order regardless of which
+        // scoped thread finishes first.
+        let keys: Vec<String> = (0..10).map(|i| format!("n{i}")).collect();
+        let origins: Vec<Origin> = keys.iter().map(|key| origin(key)).collect();
+
+        let rows = collect_with_fetcher(&origins, Duration::from_millis(50), |_, _| {
+            Ok(SAMPLE.to_string())
+        });
+
+        assert_eq!(
+            rows.workspaces.len(),
+            keys.len(),
+            "one workspace per origin"
+        );
+        let observed: Vec<&str> = rows.workspaces.iter().map(|ws| ws.id.as_str()).collect();
+        let expected: Vec<String> = keys.iter().map(|key| format!("fed~{key}~w1")).collect();
+        assert_eq!(
+            observed, expected,
+            "combined workspaces stay in origin order across chunk boundaries"
         );
     }
 }
