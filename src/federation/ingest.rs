@@ -237,6 +237,18 @@ pub struct ForeignRows {
     pub terminals: Vec<(TerminalId, TerminalState)>,
 }
 
+impl ForeignRows {
+    /// The empty projection: no foreign workspaces or terminals. Splicing this
+    /// clears every previously-injected foreign row from an `AppState`, which is
+    /// how the disabled federation flag guarantees no remote state lingers.
+    pub fn empty() -> Self {
+        Self {
+            workspaces: Vec::new(),
+            terminals: Vec::new(),
+        }
+    }
+}
+
 /// Map an [`AgentState`] from a remote `agent_status` string. Unknown values
 /// (including future variants) degrade to [`AgentState::Unknown`].
 fn agent_state_from_status(status: &str) -> AgentState {
