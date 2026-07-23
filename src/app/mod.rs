@@ -1009,15 +1009,24 @@ impl App {
         }
     }
 
+    /// Start the federation snapshot poll iff `experimental.federation` was
+    /// enabled at startup. Idempotent (no-op if already running or disabled).
+    /// Called by both the direct-TUI run loop (`App::run`) and the headless
+    /// server runtime (`HeadlessServer::run`), so the poll runs under the
+    /// production runtime and not just the legacy direct path. See robots-5gu.
+    pub(crate) fn start_federation_poll_if_enabled(&mut self) {
+        if self.state.federation_enabled {
+            self.spawn_federation_poll();
+        }
+    }
+
     pub async fn run(&mut self, terminal: &mut DefaultTerminal) -> io::Result<()> {
         if self.input_rx.is_none() {
             self.input_rx = Some(crate::raw_input::spawn_input_reader());
         }
         // Start the federation snapshot poll only when the flag is on at startup;
         // when off, no task is spawned and no federation network I/O happens.
-        if self.state.federation_enabled {
-            self.spawn_federation_poll();
-        }
+        self.start_federation_poll_if_enabled();
         self.query_host_terminal_theme();
 
         let mut needs_render = true;
@@ -2762,6 +2771,45 @@ mod tests {
                 .keys()
                 .any(|id| crate::federation::parse_foreign_terminal_id(id).is_some()),
             "disabled flag leaves no foreign terminals"
+        );
+    }
+
+    #[tokio::test]
+    async fn start_federation_poll_if_enabled_respects_the_flag() {
+        // Locks in the shared start seam both run paths call: the poll task is
+        // spawned iff experimental.federation is on at startup, and never when
+        // it is off. The headless server relied on this seam being wired
+        // (robots-5gu), so guard both branches.
+        let build_app = |federation: bool| {
+            let mut config = Config::default();
+            config.experimental.federation = federation;
+            let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+            App::new(&config, true, None, api_rx, crate::api::EventHub::default())
+        };
+
+        let mut enabled = build_app(true);
+        assert!(
+            enabled.federation_poll.is_none(),
+            "no poll task before the start seam runs"
+        );
+        enabled.start_federation_poll_if_enabled();
+        assert!(
+            enabled.federation_poll.is_some(),
+            "enabled flag spawns the poll task"
+        );
+        // Idempotent: a second call must not replace the running task.
+        enabled.start_federation_poll_if_enabled();
+        assert!(
+            enabled.federation_poll.is_some(),
+            "start seam is idempotent while running"
+        );
+        enabled.stop_federation_poll();
+
+        let mut disabled = build_app(false);
+        disabled.start_federation_poll_if_enabled();
+        assert!(
+            disabled.federation_poll.is_none(),
+            "disabled flag spawns no poll task"
         );
     }
 
