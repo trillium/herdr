@@ -3,6 +3,8 @@
 ## Unreleased
 
 ### Added
+- Fleet federation phase N1c: Background snapshot poll for federated origins. When `experimental.federation = true` at startup, Herdr discovers remote herdr servers (online Tailscale peers and static env overrides via `HERDR_FEDERATION_ORIGINS`), polls each origin's snapshot every ~5 seconds, and projects aggregated remote sessions read-only into the sidebar. Remote panes receive no input or PTY relay. Graceful lifecycle: disabling at runtime stops polling immediately; enabling defers polling to next launch. Uses `tokio::select!` with `spawn_blocking` for synchronous snapshot fetches.
+- Focus identity hardening (N1b scope): `AppState::set_foreign_rows` now captures and re-resolves workspace focus by identity after foreign splice, so persisted foreign focus follows its workspace and removed-workspace focus falls back to valid local state in release builds.
 - Herdr now keeps the outer terminal window title in sync with the session through `ui.window_title`, so window managers and terminal tab bars show the active workspace and the host the panes actually run on.
 - The desktop tab bar now has configurable right-aligned status entries for zoom state, hostname, date/time, literal text, and asynchronously refreshed command output.
 - Optional `keys.move_tab_previous` and `keys.move_tab_next` bindings now reorder the active tab in place, wrapping at either end.

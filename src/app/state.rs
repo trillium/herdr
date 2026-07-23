@@ -1531,6 +1531,19 @@ impl AppState {
     /// `experimental.federation` is toggled off) and, from N1c, by the async
     /// snapshot poll loop.
     pub fn set_foreign_rows(&mut self, rows: crate::federation::ForeignRows) {
+        // Capture the workspace identity currently under focus *before* the
+        // strip. A replace tick that removes the focused foreign workspace can
+        // then re-resolve focus by identity (foreign focus that survived the
+        // replace follows its workspace) or fall back to local state (focus on a
+        // removed workspace). Focus is a bare index, so without this a user
+        // selection that landed on a foreign workspace would be left dangling in
+        // release builds, where the debug_asserts below do not run.
+        let focused_active_id = self
+            .active
+            .and_then(|idx| self.workspaces.get(idx))
+            .map(|ws| ws.id.clone());
+        let focused_selected_id = self.workspaces.get(self.selected).map(|ws| ws.id.clone());
+
         // Strip previously-injected foreign rows, keyed on the origin-namespace
         // predicate (never a raw string check) so repeated calls replace rather
         // than accumulate.
@@ -1538,6 +1551,10 @@ impl AppState {
             .retain(|ws| !crate::federation::is_foreign_workspace_id(&ws.id));
         self.terminals
             .retain(|id, _| crate::federation::parse_foreign_terminal_id(id).is_none());
+
+        // Every remaining workspace is local now; the foreign region begins at
+        // this index once the new rows are appended.
+        let local_count = self.workspaces.len();
 
         let foreign_workspaces = rows.workspaces.len();
         let foreign_terminals = rows.terminals.len();
@@ -1551,6 +1568,16 @@ impl AppState {
         // Append after local workspaces; never insert before them, so any
         // `active`/`selected` index into local workspaces is preserved.
         self.workspaces.extend(rows.workspaces);
+
+        // Release-safe focus clamp: re-resolve focus by the identity captured
+        // above and, when the focused workspace was removed, fall back to a
+        // valid local index (the debug_asserts below only document the invariant
+        // in debug builds).
+        self.reconcile_focus_after_foreign_splice(
+            local_count,
+            focused_active_id,
+            focused_selected_id,
+        );
 
         debug_assert!(
             self.active
@@ -1567,6 +1594,54 @@ impl AppState {
             foreign_terminals,
             "federation: spliced foreign rows into app state"
         );
+    }
+
+    /// Re-resolve `active`/`selected` after a foreign splice replaced the foreign
+    /// region.
+    ///
+    /// `local_count` is the number of local workspaces (the foreign region begins
+    /// at that index). `active_id`/`selected_id` are the workspace ids that were
+    /// focused before the strip. Focus follows its workspace when that workspace
+    /// survived the replace; when the focused workspace was removed, focus falls
+    /// back to a valid local index — the previously-focused local workspace if it
+    /// survived, else the first local workspace, else index 0 when only foreign
+    /// rows remain, else `None`/`0` when the state is empty. Never leaves an index
+    /// out of bounds in release builds.
+    fn reconcile_focus_after_foreign_splice(
+        &mut self,
+        local_count: usize,
+        active_id: Option<String>,
+        selected_id: Option<String>,
+    ) {
+        fn position_of(workspaces: &[Workspace], id: &Option<String>) -> Option<usize> {
+            let id = id.as_deref()?;
+            workspaces.iter().position(|ws| ws.id == id)
+        }
+
+        let resolved_active = position_of(&self.workspaces, &active_id);
+        let resolved_selected = position_of(&self.workspaces, &selected_id);
+
+        // A guaranteed in-bounds local fallback: prefer a surviving local active
+        // workspace, else the first local workspace, else index 0 when only
+        // foreign rows remain, else none when there are no workspaces at all.
+        let local_fallback: Option<usize> = resolved_active.filter(|&idx| idx < local_count).or(
+            if local_count > 0 || !self.workspaces.is_empty() {
+                Some(0)
+            } else {
+                None
+            },
+        );
+
+        // `active` stays `None` for empty state, follows its surviving workspace,
+        // or falls back to local when its workspace was removed.
+        self.active = match self.active {
+            Some(_) => resolved_active.or(local_fallback),
+            None => None,
+        };
+
+        // `selected` is a bare index (0 when empty per the invariant): follow its
+        // surviving workspace, else fall back to a valid local index.
+        self.selected = resolved_selected.or(local_fallback).unwrap_or(0);
     }
 
     /// Flag-gated entry point the N1c poll loop will drive. When
@@ -2507,6 +2582,67 @@ mod tests {
         assert_eq!(
             state.selected, selected_before,
             "selected unchanged across strip"
+        );
+        state.assert_invariants_for_test();
+    }
+
+    #[test]
+    fn foreign_strip_clamps_release_focus_to_local() {
+        // A user selection can land on a foreign workspace in N1c; a later strip
+        // (origin gone / flag off) must not leave `active`/`selected` dangling in
+        // release builds. Drive through the production `AppState` seam, not the
+        // debug-only asserts.
+        let mut state = AppState::test_with_adversarial_identity_state();
+        let local_count = state.workspaces.len();
+        assert!(local_count > 0, "adversarial fixture has local workspaces");
+
+        state.set_foreign_rows(sample_foreign_rows("n1", "mini"));
+        let foreign_idx = state
+            .workspaces
+            .iter()
+            .position(is_foreign_workspace)
+            .expect("foreign workspace present after splice");
+
+        // Point release focus (both cursors) at the foreign workspace.
+        state.selected = foreign_idx;
+        state.active = Some(foreign_idx);
+
+        // A poll tick can splice equal rows: a persisted foreign selection must
+        // follow its workspace, not snap back to local.
+        state.set_foreign_rows(sample_foreign_rows("n1", "mini"));
+        assert!(
+            is_foreign_workspace(&state.workspaces[state.selected]),
+            "persisted foreign selection follows its workspace across a replace"
+        );
+        assert_eq!(
+            state.active,
+            Some(foreign_idx),
+            "persisted foreign active follows its workspace across a replace"
+        );
+
+        // Now strip the foreign rows entirely (removed): focus must clamp back to
+        // a valid, in-bounds LOCAL workspace.
+        state.set_foreign_rows(empty_foreign_rows());
+
+        assert!(
+            state.selected < state.workspaces.len(),
+            "selected in bounds after strip"
+        );
+        assert!(
+            state.selected < local_count,
+            "selected clamped into the local region"
+        );
+        assert!(
+            !is_foreign_workspace(&state.workspaces[state.selected]),
+            "selected points at local state"
+        );
+        let active = state
+            .active
+            .expect("active present while local workspaces exist");
+        assert!(active < local_count, "active clamped into the local region");
+        assert!(
+            !is_foreign_workspace(&state.workspaces[active]),
+            "active points at local state"
         );
         state.assert_invariants_for_test();
     }

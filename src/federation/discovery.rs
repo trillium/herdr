@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use serde::Deserialize;
 
@@ -137,6 +138,129 @@ pub fn discover(status: &TailscaleStatus, config: &DiscoveryConfig) -> Vec<Origi
     }
 
     by_key.into_values().collect()
+}
+
+/// Environment variable naming the static origin overrides, as `;`-separated
+/// `key=socket_path` entries (e.g. `mini1=/tmp/mini1-herdr.sock`).
+const STATIC_ORIGINS_ENV: &str = "HERDR_FEDERATION_ORIGINS";
+/// Environment variable overriding the forwarded-socket directory for tailnet
+/// peers.
+const SOCKET_DIR_ENV: &str = "HERDR_FEDERATION_SOCKET_DIR";
+
+/// Default directory for tailnet peers' forwarded API sockets when
+/// [`SOCKET_DIR_ENV`] is unset. Only relevant to tailnet-discovered peers;
+/// static origins carry explicit socket paths.
+fn default_forwarded_socket_dir() -> PathBuf {
+    std::env::temp_dir().join("herdr-federation")
+}
+
+/// Parse the [`STATIC_ORIGINS_ENV`] value into static origins. Entries are
+/// `;`-separated `key=socket_path`; an entry with an invalid origin key, a
+/// missing `=`, or an empty socket path is warned and skipped (self-healing —
+/// one bad entry never discards the rest).
+fn parse_static_origins(raw: &str) -> Vec<StaticOrigin> {
+    let mut origins = Vec::new();
+    for entry in raw.split(';') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let Some((key_raw, path_raw)) = entry.split_once('=') else {
+            tracing::warn!(
+                entry,
+                "federation discovery: static origin entry is not `key=socket_path`"
+            );
+            continue;
+        };
+        let path_raw = path_raw.trim();
+        if path_raw.is_empty() {
+            tracing::warn!(
+                entry,
+                "federation discovery: static origin entry has an empty socket path"
+            );
+            continue;
+        }
+        match OriginKey::new(key_raw.trim()) {
+            Ok(key) => origins.push(StaticOrigin {
+                key,
+                label: None,
+                socket_path: PathBuf::from(path_raw),
+            }),
+            Err(err) => tracing::warn!(
+                %err,
+                "federation discovery: skipping static origin with invalid key"
+            ),
+        }
+    }
+    origins
+}
+
+/// Build a [`DiscoveryConfig`] from the environment: static origins from
+/// [`STATIC_ORIGINS_ENV`] and the forwarded-socket dir from [`SOCKET_DIR_ENV`]
+/// (or a default). This is the N1c "static override" seam; a future config-model
+/// surface can replace it without touching [`discover`].
+pub fn discovery_config_from_env() -> DiscoveryConfig {
+    let forwarded_socket_dir = std::env::var_os(SOCKET_DIR_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(default_forwarded_socket_dir);
+    let static_origins = std::env::var(STATIC_ORIGINS_ENV)
+        .ok()
+        .map(|raw| parse_static_origins(&raw))
+        .unwrap_or_default();
+    DiscoveryConfig {
+        forwarded_socket_dir,
+        static_origins,
+    }
+}
+
+/// Run `tailscale status --json` at the process edge, returning the parsed
+/// status or `None` when tailscale is absent, exits non-zero, or produces
+/// unparseable output. Self-healing: any failure degrades to "no tailnet peers"
+/// rather than an error, so federation still works from static overrides alone.
+pub fn tailscale_status() -> Option<TailscaleStatus> {
+    let output = match Command::new("tailscale")
+        .args(["status", "--json"])
+        .output()
+    {
+        Ok(output) if output.status.success() => output,
+        Ok(output) => {
+            tracing::debug!(
+                status = ?output.status,
+                "federation discovery: `tailscale status` exited non-zero; no tailnet peers"
+            );
+            return None;
+        }
+        Err(err) => {
+            tracing::debug!(
+                %err,
+                "federation discovery: `tailscale status` unavailable; no tailnet peers"
+            );
+            return None;
+        }
+    };
+    match serde_json::from_slice::<TailscaleStatus>(&output.stdout) {
+        Ok(status) => Some(status),
+        Err(err) => {
+            tracing::warn!(
+                %err,
+                "federation discovery: failed to parse `tailscale status --json`"
+            );
+            None
+        }
+    }
+}
+
+/// Discover the current federated origins: online tailnet peers (best-effort,
+/// via [`tailscale_status`]) unioned with static env overrides. Static origins
+/// win on key conflict. Synchronous (spawns the `tailscale` subprocess); call
+/// off the async reactor.
+pub fn discover_origins() -> Vec<Origin> {
+    let config = discovery_config_from_env();
+    let status = tailscale_status().unwrap_or(TailscaleStatus {
+        self_node: None,
+        peers: HashMap::new(),
+    });
+    discover(&status, &config)
 }
 
 #[cfg(test)]
@@ -282,5 +406,36 @@ mod tests {
         let path = forwarded_socket_path(dir, &OriginKey::new("mini.local").unwrap());
         assert!(path.starts_with(dir));
         assert_eq!(path.components().count(), dir.components().count() + 1);
+    }
+
+    #[test]
+    fn parse_static_origins_reads_key_equals_path_entries() {
+        let origins = parse_static_origins("mini1=/tmp/mini1-herdr.sock ; mini2 = /tmp/mini2.sock");
+        assert_eq!(origins.len(), 2);
+        assert_eq!(origins[0].key, OriginKey::new("mini1").unwrap());
+        assert_eq!(
+            origins[0].socket_path,
+            PathBuf::from("/tmp/mini1-herdr.sock")
+        );
+        assert_eq!(origins[0].label, None);
+        assert_eq!(origins[1].key, OriginKey::new("mini2").unwrap());
+        assert_eq!(origins[1].socket_path, PathBuf::from("/tmp/mini2.sock"));
+    }
+
+    #[test]
+    fn parse_static_origins_skips_malformed_entries_but_keeps_valid_ones() {
+        // Empty entry, an entry with no `=`, an entry with an empty path, and an
+        // entry with an invalid key are all skipped; the one valid entry survives.
+        let origins =
+            parse_static_origins(";no-equals;bad~key=/tmp/x.sock;empty=;good=/tmp/g.sock");
+        assert_eq!(origins.len(), 1, "only the well-formed entry survives");
+        assert_eq!(origins[0].key, OriginKey::new("good").unwrap());
+        assert_eq!(origins[0].socket_path, PathBuf::from("/tmp/g.sock"));
+    }
+
+    #[test]
+    fn parse_static_origins_empty_string_yields_none() {
+        assert!(parse_static_origins("").is_empty());
+        assert!(parse_static_origins("  ;  ; ").is_empty());
     }
 }

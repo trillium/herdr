@@ -504,6 +504,21 @@ On macOS this switches to the current ASCII-capable keyboard layout; on Windows 
 On Windows, support is currently limited to the Korean IME. With an IME for any other language, this setting leaves the input source unchanged.
 :::
 
+## Fleet federation
+
+Aggregate remote herdr servers' agent sessions into your local session:
+
+```toml
+[experimental]
+federation = true
+```
+
+When enabled at startup, Herdr discovers federated origins (online Tailscale peers and static env overrides) and polls each origin's snapshot every ~5 seconds. Remote sessions are projected read-only into the sidebar — they render alongside local workspaces but receive no input, PTY relay, or events. When disabled, any previously projected remote state clears and no federation network I/O occurs.
+
+Configure static origins (non-tailnet hosts or overrides) with the `HERDR_FEDERATION_ORIGINS` environment variable. Set the socket directory for tailnet peers with `HERDR_FEDERATION_SOCKET_DIR`. Both are optional; Herdr auto-discovers Tailscale peers and uses the system temp directory by default.
+
+Runtime behavior: When toggling the flag at runtime, disabling stops polling immediately and clears foreign state; enabling defers polling to the next process start (so Herdr keeps origin discovery out of the reload handler).
+
 ## Environment variables
 
 | Variable | Purpose |
@@ -514,6 +529,8 @@ On Windows, support is currently limited to the Korean IME. With an IME for any 
 | `HERDR_PROCESS_DETECTION` | Linux process detection strategy: `native` (default) or opt-in `child-groups`. |
 | `HERDR_LOG` | Set log filtering, for example `HERDR_LOG=herdr=debug`. |
 | `HERDR_DISABLE_SOUND` | Disable sound playback even when `[ui.sound] enabled = true`. |
+| `HERDR_FEDERATION_ORIGINS` | Static federation origin overrides (when `experimental.federation` is enabled at startup). Format: semicolon-separated `key=socket_path` entries, e.g. `mini1=/tmp/mini1-herdr.sock;mini2=/tmp/mini2-herdr.sock`. Entries with invalid origin keys or missing socket paths are warned and skipped. Static origins are unioned with auto-discovered Tailscale peers and win on key conflict. |
+| `HERDR_FEDERATION_SOCKET_DIR` | Directory where tailnet peers' forwarded API sockets are expected (when `experimental.federation` is enabled at startup). Discovered peers use the convention `<dir>/<origin-key>.sock` for their socket paths. Defaults to the system temp directory if unset. |
 
 ## Logs
 
