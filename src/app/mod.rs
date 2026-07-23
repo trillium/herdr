@@ -39,6 +39,16 @@ pub(crate) const SELECTION_AUTOSCROLL_INTERVAL: Duration = Duration::from_millis
 const RESIZE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const GIT_REMOTE_STATUS_REFRESH_INTERVAL: Duration = Duration::from_millis(1500);
 const AUTO_UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(30 * 60);
+/// Cadence of the federation snapshot poll (N1c). Each tick fetches every
+/// origin's `session.snapshot` and re-projects the combined foreign rows.
+const FEDERATION_POLL_INTERVAL: Duration = Duration::from_secs(5);
+/// Per-origin request timeout for the federation snapshot poll. Kept below the
+/// poll interval so one hung origin cannot stall a tick past its own timeout.
+const FEDERATION_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
+/// Bounded capacity for the poll task -> run loop foreign-rows channel. Small:
+/// each message replaces the whole foreign projection, so only the latest tick
+/// matters and backpressure on a slow run loop is harmless.
+const FOREIGN_ROWS_CHANNEL_CAP: usize = 4;
 const PENDING_AGENT_RESUME_THEME_WAIT: Duration = Duration::from_millis(750);
 const SESSION_SAVE_DEBOUNCE: Duration = Duration::from_secs(5);
 const SIDEBAR_DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(350);
@@ -148,6 +158,35 @@ pub struct App {
     pub(crate) local_input_source_switch: bool,
     pub(crate) config_reloaded_from_disk: bool,
     prefix_input_source: Box<dyn crate::platform::PrefixInputSource>,
+    /// Sender kept alive for the lifetime of the app so the foreign-rows channel
+    /// never fully closes: the run loop's `recv()` then pends (rather than
+    /// spinning on `None`) whenever no poll task is running.
+    pub(crate) foreign_rows_tx: mpsc::Sender<crate::federation::ForeignRows>,
+    /// Receiver drained by the run loop; each message is a full replacement of
+    /// the projected foreign rows for one poll tick (N1c).
+    pub(crate) foreign_rows_rx: mpsc::Receiver<crate::federation::ForeignRows>,
+    /// Handle to the running federation poll task, present only while
+    /// `experimental.federation` was enabled at startup. `None` means no polling
+    /// and therefore no federation network I/O.
+    pub(crate) federation_poll: Option<FederationPollHandle>,
+}
+
+/// Lifecycle handle for the background federation snapshot poll task.
+pub(crate) struct FederationPollHandle {
+    /// Signals the poll task to stop before its next tick (graceful shutdown on
+    /// runtime disable).
+    shutdown: Arc<Notify>,
+    /// The spawned task; aborted as a backstop when the handle is torn down.
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl FederationPollHandle {
+    /// Stop the poll task: signal graceful shutdown, then abort as a backstop so
+    /// no further network I/O happens after federation is disabled.
+    fn stop(self) {
+        self.shutdown.notify_one();
+        self.task.abort();
+    }
 }
 
 pub(crate) const APP_EVENT_CHANNEL_CAPACITY: usize = 256;
@@ -160,6 +199,9 @@ pub(crate) enum LoopEvent {
     RawInput(crate::raw_input::RawInputEvent),
     InputClosed,
     RenderRequested,
+    /// A federation poll tick delivered a full replacement of the projected
+    /// foreign rows (N1c).
+    ForeignRows(crate::federation::ForeignRows),
 }
 
 struct SyncOutputGuard;
@@ -363,6 +405,8 @@ impl App {
         let (prefix_code, prefix_mods) = config.prefix_key();
         crate::kitty_graphics::set_enabled(config.experimental.kitty_graphics);
         let (event_tx, event_rx) = mpsc::channel::<AppEvent>(APP_EVENT_CHANNEL_CAPACITY);
+        let (foreign_rows_tx, foreign_rows_rx) =
+            mpsc::channel::<crate::federation::ForeignRows>(FOREIGN_ROWS_CHANNEL_CAP);
         let render_notify = Arc::new(Notify::new());
         let render_dirty = Arc::new(AtomicBool::new(false));
 
@@ -762,6 +806,9 @@ impl App {
             local_input_source_switch: true,
             config_reloaded_from_disk: false,
             prefix_input_source: Box::new(crate::platform::RealPrefixInputSource::default()),
+            foreign_rows_tx,
+            foreign_rows_rx,
+            federation_poll: None,
         }
     }
 
@@ -888,9 +935,88 @@ impl App {
         self.prefix_input_source = source;
     }
 
+    /// Spawn the background federation snapshot poll task, if not already
+    /// running. Discovers origins once (tailscale ∪ static env override) inside a
+    /// blocking thread, then polls each origin's snapshot every
+    /// [`FEDERATION_POLL_INTERVAL`] and forwards the combined foreign rows to the
+    /// run loop. Only called when `experimental.federation` is enabled at
+    /// startup; a runtime enable (via config reload) defers polling to the next
+    /// process start by design.
+    fn spawn_federation_poll(&mut self) {
+        if self.federation_poll.is_some() {
+            return;
+        }
+        let shutdown = Arc::new(Notify::new());
+        let task_shutdown = shutdown.clone();
+        let tx = self.foreign_rows_tx.clone();
+        let task = tokio::spawn(async move {
+            // Discover origins once at task start (subprocess: off the reactor).
+            let origins = match tokio::task::spawn_blocking(crate::federation::discover_origins)
+                .await
+            {
+                Ok(origins) => origins,
+                Err(err) => {
+                    tracing::warn!(%err, "federation poll: origin discovery task failed; poll idle");
+                    Vec::new()
+                }
+            };
+            if origins.is_empty() {
+                tracing::info!(
+                    "federation poll: no origins discovered; poll running but idle (set HERDR_FEDERATION_ORIGINS)"
+                );
+            } else {
+                tracing::info!(count = origins.len(), "federation poll: polling origins");
+            }
+
+            loop {
+                // Fetch every origin's snapshot on a blocking thread (ApiClient is
+                // synchronous), then hand the combined rows to the run loop.
+                let poll_origins = origins.clone();
+                match tokio::task::spawn_blocking(move || {
+                    crate::federation::collect_foreign_rows(
+                        &poll_origins,
+                        FEDERATION_REQUEST_TIMEOUT,
+                    )
+                })
+                .await
+                {
+                    Ok(rows) => {
+                        if tx.send(rows).await.is_err() {
+                            // Run loop gone: nothing left to feed.
+                            break;
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!(%err, "federation poll: blocking collection task failed");
+                    }
+                }
+
+                tokio::select! {
+                    _ = task_shutdown.notified() => break,
+                    _ = tokio::time::sleep(FEDERATION_POLL_INTERVAL) => {}
+                }
+            }
+            tracing::debug!("federation poll: task stopped");
+        });
+        self.federation_poll = Some(FederationPollHandle { shutdown, task });
+    }
+
+    /// Stop the federation poll task if one is running, so a disabled runtime
+    /// performs no further federation network I/O.
+    fn stop_federation_poll(&mut self) {
+        if let Some(handle) = self.federation_poll.take() {
+            handle.stop();
+        }
+    }
+
     pub async fn run(&mut self, terminal: &mut DefaultTerminal) -> io::Result<()> {
         if self.input_rx.is_none() {
             self.input_rx = Some(crate::raw_input::spawn_input_reader());
+        }
+        // Start the federation snapshot poll only when the flag is on at startup;
+        // when off, no task is spawned and no federation network I/O happens.
+        if self.state.federation_enabled {
+            self.spawn_federation_poll();
         }
         self.query_host_terminal_theme();
 
@@ -1098,6 +1224,13 @@ impl App {
                         Some(input) => LoopEvent::RawInput(input),
                         None => LoopEvent::InputClosed,
                     },
+                    maybe_rows = self.foreign_rows_rx.recv() => match maybe_rows {
+                        // `self` holds a live `foreign_rows_tx`, so the channel
+                        // never fully closes: `None` cannot occur and, with no
+                        // poll task, this branch simply pends.
+                        Some(rows) => LoopEvent::ForeignRows(rows),
+                        None => LoopEvent::Timer,
+                    },
                     _ = sleep_until_or_pending(next_deadline) => LoopEvent::Timer,
                     _ = self.render_notify.notified() => LoopEvent::RenderRequested,
                 }
@@ -1126,6 +1259,13 @@ impl App {
                     if self.render_dirty.load(Ordering::Acquire) {
                         needs_render = true;
                     }
+                }
+                LoopEvent::ForeignRows(rows) => {
+                    // The flag-gated seam replaces the foreign projection when
+                    // federation is enabled and clears it (ignoring `rows`) when
+                    // it is not, so a tick that races a disable is a safe no-op.
+                    self.state.apply_foreign_rows(rows);
+                    needs_render = true;
                 }
             }
         }
@@ -1460,12 +1600,19 @@ impl App {
             let was_federation_enabled = self.state.federation_enabled;
             self.state.federation_enabled = config.experimental.federation;
             if was_federation_enabled && !config.experimental.federation {
-                // Toggled off at runtime: drop any projected foreign rows so a
-                // disabled build never keeps remote state, mirroring the
-                // kitty-graphics teardown above.
+                // Toggled off at runtime: stop polling so a disabled runtime does
+                // no further federation network I/O, then drop any projected
+                // foreign rows so a disabled build never keeps remote state,
+                // mirroring the kitty-graphics teardown above.
+                self.stop_federation_poll();
                 self.state
                     .set_foreign_rows(crate::federation::ForeignRows::empty());
             }
+            // Enabling federation at runtime deliberately does NOT spawn the poll
+            // task here: the poll starts only at process startup (see `run`), so a
+            // reload enable takes effect on next launch. Keeping the spawn out of
+            // the reload path avoids running origin discovery from the reload
+            // handler and keeps the disable/enable lifecycle single-sourced.
         }
 
         if !invalid_section("advanced") {
@@ -2531,6 +2678,90 @@ mod tests {
                 .keys()
                 .any(|id| crate::federation::parse_foreign_terminal_id(id).is_some()),
             "foreign terminals cleared on disable"
+        );
+    }
+
+    #[test]
+    fn poll_channel_projects_foreign_rows_when_enabled_and_noops_when_disabled() {
+        // Exercises the N1c live poll application path end to end without a real
+        // socket: a poll tick's `ForeignRows` is delivered on the same channel
+        // the poll task uses, drained exactly as the run loop's select! branch
+        // does (`recv` -> `apply_foreign_rows`), and the projection is asserted
+        // to reach the sidebar. With the flag off the same delivery is a no-op.
+        let mut config = Config::default();
+        config.experimental.federation = true;
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(&config, true, None, api_rx, crate::api::EventHub::default());
+        assert!(app.state.federation_enabled, "flag on at construction");
+
+        let tick_rows = || {
+            let body = include_str!("../federation/testdata/sample-session-snapshot.json");
+            let snap = crate::federation::RemoteSnapshot::from_api_response(body)
+                .expect("sample fixture parses");
+            let origin = crate::federation::Origin::new(
+                crate::federation::OriginKey::new("mini1").expect("valid origin key"),
+                "mini1",
+                crate::federation::ConnectionTarget::LocalSocket(std::path::PathBuf::from(
+                    "/tmp/fed-poll-channel-test.sock",
+                )),
+            );
+            crate::federation::foreign_rows(&origin, &snap)
+        };
+
+        // Enabled: deliver a tick on the channel, drain + apply as the run loop
+        // does, and assert the foreign rows reach both app state and the sidebar.
+        app.foreign_rows_tx
+            .try_send(tick_rows())
+            .expect("foreign rows channel has capacity");
+        let delivered = app
+            .foreign_rows_rx
+            .try_recv()
+            .expect("a foreign rows tick is queued");
+        app.state.apply_foreign_rows(delivered);
+
+        assert!(
+            app.state
+                .workspaces
+                .iter()
+                .any(|ws| crate::federation::is_foreign_workspace_id(&ws.id)),
+            "foreign rows projected into state when enabled"
+        );
+        let entries = crate::ui::all_agent_panel_entries(&app.state);
+        assert!(
+            entries.iter().any(|entry| app
+                .state
+                .workspaces
+                .get(entry.ws_idx)
+                .is_some_and(|ws| crate::federation::is_foreign_workspace_id(&ws.id))),
+            "sidebar surfaces a foreign entry when enabled"
+        );
+
+        // Disabled: the same channel delivery must clear rather than project —
+        // apply_foreign_rows is the only flag-gated seam, so a tick that races a
+        // disable is a safe no-op.
+        app.state.federation_enabled = false;
+        app.foreign_rows_tx
+            .try_send(tick_rows())
+            .expect("foreign rows channel has capacity");
+        let delivered = app
+            .foreign_rows_rx
+            .try_recv()
+            .expect("a foreign rows tick is queued");
+        app.state.apply_foreign_rows(delivered);
+
+        assert!(
+            !app.state
+                .workspaces
+                .iter()
+                .any(|ws| crate::federation::is_foreign_workspace_id(&ws.id)),
+            "disabled flag makes the channel-delivered rows a no-op"
+        );
+        assert!(
+            !app.state
+                .terminals
+                .keys()
+                .any(|id| crate::federation::parse_foreign_terminal_id(id).is_some()),
+            "disabled flag leaves no foreign terminals"
         );
     }
 
