@@ -30,6 +30,7 @@ mod namespace;
 mod origin;
 mod poll;
 mod registry;
+pub mod relay;
 
 pub use discovery::{
     discover, discover_origins, forwarded_socket_path, DiscoveryConfig, StaticOrigin,

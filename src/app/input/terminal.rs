@@ -1,5 +1,6 @@
 use bytes::Bytes;
 use crossterm::event::KeyCode;
+use std::time::Duration;
 use tracing::{debug, warn};
 
 use crate::{
@@ -23,6 +24,16 @@ fn is_modifier_only_key(code: &KeyCode) -> bool {
     matches!(code, KeyCode::Modifier(_))
 }
 
+/// Extract the origin key from a namespaced foreign id (fed~<key>~<raw>).
+fn extract_origin_key_from_namespaced_id(id: &str) -> Option<String> {
+    let rest = id.strip_prefix("fed~")?;
+    let (key, _raw) = rest.split_once('~')?;
+    if key.is_empty() {
+        return None;
+    }
+    Some(key.to_string())
+}
+
 impl App {
     pub(crate) fn handle_terminal_key_headless(&mut self, key: TerminalKey) {
         match self.prepare_popup_key_forward(key) {
@@ -43,6 +54,8 @@ impl App {
         };
         if let Some(runtime) = self.lookup_runtime_sender(input.ws_idx, input.pane_id) {
             let _ = runtime.try_send_bytes(input.bytes);
+        } else {
+            self.try_send_foreign_pane_input_headless(input.ws_idx, input.pane_id, &input.bytes);
         }
     }
 
@@ -248,7 +261,125 @@ impl App {
         };
         if let Some(runtime) = self.lookup_runtime_sender(input.ws_idx, input.pane_id) {
             let _ = runtime.send_bytes(input.bytes).await;
+        } else {
+            self.try_send_foreign_pane_input(input.ws_idx, input.pane_id, &input.bytes).await;
         }
+    }
+
+    /// Attempt to send input to a foreign pane via federation relay.
+    ///
+    /// Checks if the pane belongs to a foreign workspace; if so, spawns a blocking
+    /// task to relay the input to the remote origin's JSON API. Errors are logged
+    /// and never block or crash the local UI.
+    fn try_send_foreign_pane_input_headless(
+        &self,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+        bytes: &[u8],
+    ) {
+        // Get the workspace to check if it's foreign
+        let Some(ws) = self.state.workspaces.get(ws_idx) else {
+            return;
+        };
+
+        // Only attempt relay if federation is enabled
+        if !self.state.config.experimental.federation {
+            return;
+        }
+
+        if !crate::federation::is_foreign_workspace_id(&ws.id) {
+            return;
+        }
+
+        // Extract origin key from the namespaced workspace id (fed~<key>~<raw>)
+        let origin_key = match extract_origin_key_from_namespaced_id(&ws.id) {
+            Some(k) => k,
+            None => return,
+        };
+
+        let Some(terminal_id) = ws.terminal_id(pane_id) else {
+            return;
+        };
+
+        // Extract the raw (non-namespaced) terminal id from fed~<key>~<raw>
+        let raw_terminal_id = match crate::federation::parse_foreign_terminal_id(&terminal_id) {
+            Some((_, raw)) => raw.as_str().to_string(),
+            None => return,
+        };
+
+        let bytes = bytes.to_vec();
+
+        tokio::spawn(async move {
+            // Discover origins and find the matching one
+            let origins = match tokio::task::spawn_blocking(crate::federation::discover_origins)
+                .await
+            {
+                Ok(origins) => origins,
+                Err(_) => {
+                    warn!("failed to discover origins for foreign pane input relay");
+                    return;
+                }
+            };
+
+            let origin = match origins.into_iter().find(|o| o.key.as_str() == origin_key) {
+                Some(o) => o,
+                None => {
+                    warn!(
+                        origin = origin_key,
+                        "origin not found for foreign pane input relay"
+                    );
+                    return;
+                }
+            };
+
+            // Send input in a blocking context
+            let result = tokio::task::spawn_blocking(move || {
+                crate::federation::relay::send_input_to_foreign_pane(
+                    &origin,
+                    &raw_terminal_id,
+                    Some(&bytes),
+                    Duration::from_secs(1),
+                )
+            })
+            .await;
+
+            match result {
+                Ok(Ok(())) => {
+                    debug!(
+                        origin = origin_key,
+                        pane = %raw_terminal_id,
+                        bytes = bytes.len(),
+                        "sent input to foreign pane"
+                    );
+                }
+                Ok(Err(err)) => {
+                    warn!(
+                        origin = origin_key,
+                        pane = %raw_terminal_id,
+                        error = %err,
+                        "failed to send input to foreign pane"
+                    );
+                }
+                Err(err) => {
+                    warn!(
+                        origin = origin_key,
+                        pane = %raw_terminal_id,
+                        error = %err,
+                        "relay task error"
+                    );
+                }
+            }
+        });
+    }
+
+    /// Async version of try_send_foreign_pane_input_headless.
+    async fn try_send_foreign_pane_input(
+        &self,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+        bytes: &[u8],
+    ) {
+        self.try_send_foreign_pane_input_headless(ws_idx, pane_id, bytes);
     }
 }
 
@@ -1748,5 +1879,25 @@ mod tests {
             .and_then(crate::terminal::TerminalRuntime::scroll_metrics)
             .expect("scroll metrics after PageUp");
         assert_eq!(end_metrics.offset_from_bottom, 0);
+    }
+
+    #[test]
+    fn extract_origin_key_from_namespaced_id_valid() {
+        assert_eq!(
+            extract_origin_key_from_namespaced_id("fed~nUP~w5"),
+            Some("nUP".to_string())
+        );
+        assert_eq!(
+            extract_origin_key_from_namespaced_id("fed~mini1~w1"),
+            Some("mini1".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_origin_key_from_namespaced_id_invalid() {
+        assert_eq!(extract_origin_key_from_namespaced_id("w5"), None);
+        assert_eq!(extract_origin_key_from_namespaced_id("fed~w5"), None);
+        assert_eq!(extract_origin_key_from_namespaced_id("fed~~w5"), None);
+        assert_eq!(extract_origin_key_from_namespaced_id("fed~nUP~"), None);
     }
 }
