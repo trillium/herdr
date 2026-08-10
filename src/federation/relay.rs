@@ -97,7 +97,7 @@ mod tests {
 
     #[test]
     fn relay_error_display() {
-        let err = RelayError::Api(crate::api::client::ApiClientError::Connection(
+        let err = RelayError::Api(crate::api::client::ApiClientError::Io(
             std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "test"),
         ));
         assert!(err.to_string().contains("relay request failed"));
@@ -149,7 +149,7 @@ mod tests {
 
     #[test]
     fn relay_error_implements_display() {
-        let api_err = RelayError::Api(crate::api::client::ApiClientError::Connection(
+        let api_err = RelayError::Api(crate::api::client::ApiClientError::Io(
             std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "connection refused"),
         ));
         let msg = api_err.to_string();
@@ -159,7 +159,7 @@ mod tests {
     #[test]
     fn relay_error_implements_error_trait() {
         use std::error::Error;
-        let api_err = RelayError::Api(crate::api::client::ApiClientError::Connection(
+        let api_err = RelayError::Api(crate::api::client::ApiClientError::Io(
             std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "test"),
         ));
         let _: &dyn Error = &api_err;
