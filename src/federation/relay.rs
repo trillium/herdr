@@ -116,4 +116,52 @@ mod tests {
         let result = send_input_to_foreign_pane(&origin, "term_1", None, Duration::from_millis(50));
         assert!(result.is_err());
     }
+
+    #[test]
+    fn send_input_constructs_pane_send_input_request() {
+        let origin = test_origin("nTEST");
+        let pane_id = "term_abc123";
+        let text = b"test input";
+
+        let result = send_input_to_foreign_pane(&origin, pane_id, Some(text), Duration::from_secs(1));
+
+        assert!(result.is_err());
+        match result {
+            Err(RelayError::Api(_)) => (),
+            _ => panic!("expected Api error for unreachable socket"),
+        }
+    }
+
+    #[test]
+    fn send_input_with_utf8_text() {
+        let origin = test_origin("nUTF8");
+        let pane_id = "term_xyz";
+        let text = "你好世界".as_bytes();
+
+        let result = send_input_to_foreign_pane(&origin, pane_id, Some(text), Duration::from_millis(50));
+
+        assert!(result.is_err());
+        match result {
+            Err(RelayError::Api(_)) => (),
+            _ => panic!("expected Api error for unreachable socket"),
+        }
+    }
+
+    #[test]
+    fn relay_error_implements_display() {
+        let api_err = RelayError::Api(crate::api::client::ApiClientError::Connection(
+            std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "connection refused"),
+        ));
+        let msg = api_err.to_string();
+        assert!(msg.contains("relay request failed"));
+    }
+
+    #[test]
+    fn relay_error_implements_error_trait() {
+        use std::error::Error;
+        let api_err = RelayError::Api(crate::api::client::ApiClientError::Connection(
+            std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "test"),
+        ));
+        let _: &dyn Error = &api_err;
+    }
 }

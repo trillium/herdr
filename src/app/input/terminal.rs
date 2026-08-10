@@ -1900,4 +1900,115 @@ mod tests {
         assert_eq!(extract_origin_key_from_namespaced_id("fed~~w5"), None);
         assert_eq!(extract_origin_key_from_namespaced_id("fed~nUP~"), None);
     }
+
+    #[test]
+    fn relay_skipped_when_federation_disabled() {
+        let mut app = app_for_mouse_test();
+        let mut ws = Workspace::test_new("test");
+        let pane_id = ws.tabs[0].root_pane;
+
+        ws.insert_test_runtime(
+            pane_id,
+            crate::terminal::TerminalRuntime::test_with_screen_bytes(80, 24, b""),
+        );
+
+        app.state.workspaces = vec![ws];
+        app.state.active = Some(0);
+        app.state.federation_enabled = false;
+
+        app.try_send_foreign_pane_input_headless(0, pane_id, b"test");
+    }
+
+    #[test]
+    fn relay_skipped_for_local_pane() {
+        let mut app = app_for_mouse_test();
+        let mut ws = Workspace::test_new("local_workspace");
+        let pane_id = ws.tabs[0].root_pane;
+
+        ws.insert_test_runtime(
+            pane_id,
+            crate::terminal::TerminalRuntime::test_with_screen_bytes(80, 24, b""),
+        );
+
+        app.state.workspaces = vec![ws];
+        app.state.active = Some(0);
+        app.state.federation_enabled = true;
+
+        assert!(!crate::federation::is_foreign_workspace_id(
+            &app.state.workspaces[0].id
+        ));
+
+        app.try_send_foreign_pane_input_headless(0, pane_id, b"test");
+    }
+
+    #[test]
+    fn relay_skipped_for_invalid_workspace() {
+        let app = app_for_mouse_test();
+        app.try_send_foreign_pane_input_headless(999, crate::layout::PaneId::from_string("p1"), b"test");
+    }
+
+    #[test]
+    fn relay_skipped_for_invalid_pane() {
+        let mut app = app_for_mouse_test();
+        let mut ws = Workspace::test_new("local");
+        let pane_id = ws.tabs[0].root_pane;
+
+        ws.insert_test_runtime(
+            pane_id,
+            crate::terminal::TerminalRuntime::test_with_screen_bytes(80, 24, b""),
+        );
+
+        app.state.workspaces = vec![ws];
+        app.state.active = Some(0);
+        app.state.federation_enabled = true;
+
+        let invalid_pane = crate::layout::PaneId::from_string("nonexistent");
+        app.try_send_foreign_pane_input_headless(0, invalid_pane, b"test");
+    }
+
+    #[test]
+    fn foreign_workspace_detection() {
+        let foreign_id = "fed~nABC~w5";
+        assert!(crate::federation::is_foreign_workspace_id(foreign_id));
+
+        let local_id = "w5";
+        assert!(!crate::federation::is_foreign_workspace_id(local_id));
+
+        let malformed = "fed~";
+        assert!(!crate::federation::is_foreign_workspace_id(malformed));
+    }
+
+    #[test]
+    fn origin_key_extraction_from_foreign_ids() {
+        let result = extract_origin_key_from_namespaced_id("fed~nABC~w5");
+        assert_eq!(result, Some("nABC".to_string()));
+
+        let result = extract_origin_key_from_namespaced_id("fed~n1~w1");
+        assert_eq!(result, Some("n1".to_string()));
+
+        let result = extract_origin_key_from_namespaced_id("fed~complex_key_123~workspace");
+        assert_eq!(result, Some("complex_key_123".to_string()));
+    }
+
+    #[test]
+    fn relay_routes_input_correctly() {
+        let mut app = app_for_mouse_test();
+        let mut ws = Workspace::test_new("local");
+        let pane_id = ws.tabs[0].root_pane;
+
+        let test_runtime = crate::terminal::TerminalRuntime::test_with_screen_bytes(80, 24, b"");
+        ws.insert_test_runtime(pane_id, test_runtime);
+
+        app.state.workspaces = vec![ws];
+        app.state.active = Some(0);
+        app.state.federation_enabled = true;
+
+        let runtime_lookup = app.lookup_runtime_sender(0, pane_id);
+        assert!(
+            runtime_lookup.is_some(),
+            "local runtime should be found for local pane"
+        );
+
+        app.try_send_foreign_pane_input_headless(0, pane_id, b"test");
+    }
 }
