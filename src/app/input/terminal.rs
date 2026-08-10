@@ -1904,6 +1904,8 @@ mod tests {
     #[test]
     fn relay_skipped_when_federation_disabled() {
         let mut app = app_for_mouse_test();
+        assert!(!app.state.config.experimental.federation, "federation must default to false");
+
         let mut ws = Workspace::test_new("test");
         let pane_id = ws.tabs[0].root_pane;
 
@@ -1914,7 +1916,6 @@ mod tests {
 
         app.state.workspaces = vec![ws];
         app.state.active = Some(0);
-        app.state.federation_enabled = false;
 
         app.try_send_foreign_pane_input_headless(0, pane_id, b"test");
     }
@@ -1922,6 +1923,7 @@ mod tests {
     #[test]
     fn relay_skipped_for_local_pane() {
         let mut app = app_for_mouse_test();
+        app.state.config.experimental.federation = true;
         let mut ws = Workspace::test_new("local_workspace");
         let pane_id = ws.tabs[0].root_pane;
 
@@ -1932,7 +1934,6 @@ mod tests {
 
         app.state.workspaces = vec![ws];
         app.state.active = Some(0);
-        app.state.federation_enabled = true;
 
         assert!(!crate::federation::is_foreign_workspace_id(
             &app.state.workspaces[0].id
@@ -1944,12 +1945,15 @@ mod tests {
     #[test]
     fn relay_skipped_for_invalid_workspace() {
         let app = app_for_mouse_test();
+        assert!(app.state.workspaces.get(999).is_none(), "invalid workspace index should not exist");
+
         app.try_send_foreign_pane_input_headless(999, crate::layout::PaneId::from_string("p1"), b"test");
     }
 
     #[test]
     fn relay_skipped_for_invalid_pane() {
         let mut app = app_for_mouse_test();
+        app.state.config.experimental.federation = true;
         let mut ws = Workspace::test_new("local");
         let pane_id = ws.tabs[0].root_pane;
 
@@ -1960,9 +1964,10 @@ mod tests {
 
         app.state.workspaces = vec![ws];
         app.state.active = Some(0);
-        app.state.federation_enabled = true;
 
         let invalid_pane = crate::layout::PaneId::from_string("nonexistent");
+        assert!(app.state.workspaces[0].terminal_id(invalid_pane).is_none(), "invalid pane should have no terminal id");
+
         app.try_send_foreign_pane_input_headless(0, invalid_pane, b"test");
     }
 
@@ -1993,6 +1998,7 @@ mod tests {
     #[test]
     fn relay_routes_input_correctly() {
         let mut app = app_for_mouse_test();
+        app.state.config.experimental.federation = true;
         let mut ws = Workspace::test_new("local");
         let pane_id = ws.tabs[0].root_pane;
 
@@ -2001,7 +2007,6 @@ mod tests {
 
         app.state.workspaces = vec![ws];
         app.state.active = Some(0);
-        app.state.federation_enabled = true;
 
         let runtime_lookup = app.lookup_runtime_sender(0, pane_id);
         assert!(
@@ -2010,5 +2015,31 @@ mod tests {
         );
 
         app.try_send_foreign_pane_input_headless(0, pane_id, b"test");
+    }
+
+    #[test]
+    fn federation_enabled_with_foreign_workspace_attempts_relay() {
+        let mut app = app_for_mouse_test();
+        app.state.config.experimental.federation = true;
+
+        let foreign_ws_id = "fed~nTEST123~w1";
+        let mut ws = Workspace::test_new("test");
+        ws.id = foreign_ws_id.to_string();
+
+        let pane_id = ws.tabs[0].root_pane;
+        ws.insert_test_runtime(
+            pane_id,
+            crate::terminal::TerminalRuntime::test_with_screen_bytes(80, 24, b""),
+        );
+
+        app.state.workspaces = vec![ws];
+        app.state.active = Some(0);
+
+        assert!(crate::federation::is_foreign_workspace_id(
+            &app.state.workspaces[0].id
+        ));
+        assert!(app.state.config.experimental.federation);
+
+        app.try_send_foreign_pane_input_headless(0, pane_id, b"test input");
     }
 }
