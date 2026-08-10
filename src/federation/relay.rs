@@ -87,7 +87,8 @@ mod tests {
     #[test]
     fn unreachable_remote_returns_api_error() {
         let origin = test_origin("nDOWN");
-        let result = send_input_to_foreign_pane(&origin, "term_1", Some(b"test"), Duration::from_millis(50));
+        let result =
+            send_input_to_foreign_pane(&origin, "term_1", Some(b"test"), Duration::from_millis(50));
         assert!(result.is_err());
         match result {
             Err(RelayError::Api(_)) => (),
@@ -97,16 +98,18 @@ mod tests {
 
     #[test]
     fn relay_error_display() {
-        let err = RelayError::Api(crate::api::client::ApiClientError::Io(
-            std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "test"),
-        ));
+        let err = RelayError::Api(crate::api::client::ApiClientError::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "test",
+        )));
         assert!(err.to_string().contains("relay request failed"));
     }
 
     #[test]
     fn send_input_with_empty_bytes() {
         let origin = test_origin("nDOWN");
-        let result = send_input_to_foreign_pane(&origin, "term_1", Some(b""), Duration::from_millis(50));
+        let result =
+            send_input_to_foreign_pane(&origin, "term_1", Some(b""), Duration::from_millis(50));
         assert!(result.is_err());
     }
 
@@ -123,7 +126,8 @@ mod tests {
         let pane_id = "term_abc123";
         let text = b"test input";
 
-        let result = send_input_to_foreign_pane(&origin, pane_id, Some(text), Duration::from_secs(1));
+        let result =
+            send_input_to_foreign_pane(&origin, pane_id, Some(text), Duration::from_secs(1));
 
         assert!(result.is_err());
         match result {
@@ -138,7 +142,8 @@ mod tests {
         let pane_id = "term_xyz";
         let text = "你好世界".as_bytes();
 
-        let result = send_input_to_foreign_pane(&origin, pane_id, Some(text), Duration::from_millis(50));
+        let result =
+            send_input_to_foreign_pane(&origin, pane_id, Some(text), Duration::from_millis(50));
 
         assert!(result.is_err());
         match result {
@@ -149,9 +154,10 @@ mod tests {
 
     #[test]
     fn relay_error_implements_display() {
-        let api_err = RelayError::Api(crate::api::client::ApiClientError::Io(
-            std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "connection refused"),
-        ));
+        let api_err = RelayError::Api(crate::api::client::ApiClientError::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "connection refused",
+        )));
         let msg = api_err.to_string();
         assert!(msg.contains("relay request failed"));
     }
@@ -159,9 +165,10 @@ mod tests {
     #[test]
     fn relay_error_implements_error_trait() {
         use std::error::Error;
-        let api_err = RelayError::Api(crate::api::client::ApiClientError::Io(
-            std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "test"),
-        ));
+        let api_err = RelayError::Api(crate::api::client::ApiClientError::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "test",
+        )));
         let _: &dyn Error = &api_err;
     }
 }

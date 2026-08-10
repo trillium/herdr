@@ -262,7 +262,8 @@ impl App {
         if let Some(runtime) = self.lookup_runtime_sender(input.ws_idx, input.pane_id) {
             let _ = runtime.send_bytes(input.bytes).await;
         } else {
-            self.try_send_foreign_pane_input(input.ws_idx, input.pane_id, &input.bytes).await;
+            self.try_send_foreign_pane_input(input.ws_idx, input.pane_id, &input.bytes)
+                .await;
         }
     }
 
@@ -302,7 +303,7 @@ impl App {
         };
 
         // Extract the raw (non-namespaced) terminal id from fed~<key>~<raw>
-        let raw_terminal_id = match crate::federation::parse_foreign_terminal_id(&terminal_id) {
+        let raw_terminal_id = match crate::federation::parse_foreign_terminal_id(terminal_id) {
             Some((_, raw)) => raw.as_str().to_string(),
             None => return,
         };
@@ -311,15 +312,14 @@ impl App {
 
         tokio::spawn(async move {
             // Discover origins and find the matching one
-            let origins = match tokio::task::spawn_blocking(crate::federation::discover_origins)
-                .await
-            {
-                Ok(origins) => origins,
-                Err(_) => {
-                    warn!("failed to discover origins for foreign pane input relay");
-                    return;
-                }
-            };
+            let origins =
+                match tokio::task::spawn_blocking(crate::federation::discover_origins).await {
+                    Ok(origins) => origins,
+                    Err(_) => {
+                        warn!("failed to discover origins for foreign pane input relay");
+                        return;
+                    }
+                };
 
             let origin = match origins.into_iter().find(|o| o.key.as_str() == origin_key) {
                 Some(o) => o,
@@ -1906,7 +1906,10 @@ mod tests {
     #[tokio::test]
     async fn relay_skipped_when_federation_disabled() {
         let mut app = app_for_mouse_test();
-        assert!(!app.state.federation_enabled, "federation must default to false");
+        assert!(
+            !app.state.federation_enabled,
+            "federation must default to false"
+        );
 
         let mut ws = Workspace::test_new("test");
         let pane_id = ws.tabs[0].root_pane;
@@ -1947,7 +1950,10 @@ mod tests {
     #[test]
     fn relay_skipped_for_invalid_workspace() {
         let app = app_for_mouse_test();
-        assert!(app.state.workspaces.get(999).is_none(), "invalid workspace index should not exist");
+        assert!(
+            app.state.workspaces.get(999).is_none(),
+            "invalid workspace index should not exist"
+        );
 
         app.try_send_foreign_pane_input_headless(999, crate::layout::PaneId::from_raw(1), b"test");
     }
@@ -1968,7 +1974,10 @@ mod tests {
         app.state.active = Some(0);
 
         let invalid_pane = crate::layout::PaneId::from_raw(9999);
-        assert!(app.state.workspaces[0].terminal_id(invalid_pane).is_none(), "invalid pane should have no terminal id");
+        assert!(
+            app.state.workspaces[0].terminal_id(invalid_pane).is_none(),
+            "invalid pane should have no terminal id"
+        );
 
         app.try_send_foreign_pane_input_headless(0, invalid_pane, b"test");
     }
