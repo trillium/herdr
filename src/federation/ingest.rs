@@ -37,9 +37,9 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
+use crate::render_signal::RenderSignal;
 use ratatui::layout::Direction;
 use serde::Deserialize;
 use tokio::sync::{mpsc, Notify};
@@ -303,7 +303,7 @@ pub fn foreign_rows(origin: &Origin, snap: &RemoteSnapshot) -> ForeignRows {
     // tab exactly as the live app shares its app-wide handles.
     let (events, _events_rx) = mpsc::channel::<AppEvent>(FOREIGN_EVENT_CHANNEL_CAP);
     let render_notify = Arc::new(Notify::new());
-    let render_dirty = Arc::new(AtomicBool::new(false));
+    let render_dirty = Arc::new(RenderSignal::new());
 
     let workspaces = ws_accum
         .into_iter()
@@ -414,7 +414,7 @@ impl WorkspaceAccum {
         snap: &RemoteSnapshot,
         events: &mpsc::Sender<AppEvent>,
         render_notify: &Arc<Notify>,
-        render_dirty: &Arc<AtomicBool>,
+        render_dirty: &Arc<RenderSignal>,
     ) -> Workspace {
         let remote = snap
             .workspaces
@@ -450,8 +450,13 @@ impl WorkspaceAccum {
         Workspace {
             id: namespace_public_id(&origin.key, &self.id),
             custom_name: Some(label),
+            cached_identity_cwd: identity_cwd.clone(),
             identity_cwd,
-            // Never run git against untrusted remote paths.
+            // Never run git against untrusted remote paths; foreign workspaces
+            // carry no auto label or git-status cache key so the periodic Git
+            // refresh never targets a remote path.
+            cached_auto_label: String::new(),
+            cached_git_status_key: PathBuf::new(),
             cached_git_branch: None,
             cached_git_ahead_behind: None,
             cached_git_space: None,
@@ -479,14 +484,22 @@ fn build_tab(
     terminals: &[TerminalId],
     events: mpsc::Sender<AppEvent>,
     render_notify: Arc<Notify>,
-    render_dirty: Arc<AtomicBool>,
+    render_dirty: Arc<RenderSignal>,
     public_pane_numbers: &mut HashMap<PaneId, usize>,
     next_public_pane_number: &mut usize,
 ) -> Tab {
     let (mut layout, root_pane) = TileLayout::new();
     let mut pane_ids = vec![root_pane];
     for _ in 1..terminals.len() {
-        pane_ids.push(layout.split_focused(Direction::Horizontal));
+        // Mirror the (test-only) `split_focused`: split the focused pane and move
+        // focus to the new pane. Foreign panes never spawn a local runtime, so the
+        // production `Tab` split path (with runtime rollback) does not apply here.
+        let focus = layout.focused();
+        let new_pane = layout
+            .split_pane(focus, Direction::Horizontal, 0.5)
+            .expect("focused pane is in the layout");
+        layout.focus_pane(new_pane);
+        pane_ids.push(new_pane);
     }
 
     let mut panes = HashMap::with_capacity(terminals.len());
