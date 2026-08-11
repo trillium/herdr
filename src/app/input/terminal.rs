@@ -16,6 +16,7 @@ struct PreparedPaneInput {
     bytes: Bytes,
 }
 
+#[derive(Clone)]
 struct RelayQueueItem {
     origin_key: String,
     raw_terminal_id: String,
@@ -336,11 +337,42 @@ impl App {
         // Route through bounded FIFO channel keyed by origin_key.
         // If no worker exists for this origin yet, create the channel and spawn the worker.
         let workers = relay_workers();
-        let mut workers_map = workers.lock().unwrap();
-        let send_result = if let Some(sender) = workers_map.get(&origin_key) {
-            sender.try_send(item)
-        } else {
-            // First keystroke to this origin: create channel and spawn worker.
+        let mut workers_map = match workers.lock() {
+            Ok(map) => map,
+            Err(poisoned) => {
+                warn!("relay workers mutex poisoned, recovering");
+                poisoned.into_inner()
+            }
+        };
+
+        // Try to send through existing sender if one exists.
+        let mut sent = false;
+        if let Some(sender) = workers_map.get(&origin_key) {
+            match sender.try_send(item.clone()) {
+                Ok(()) => {
+                    sent = true;
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    // Worker exited; remove stale entry so we recreate below.
+                    warn!(
+                        origin = %origin_key,
+                        "relay worker channel closed, recreating worker"
+                    );
+                    workers_map.remove(&origin_key);
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    warn!(
+                        origin = %origin_key,
+                        "relay queue full, dropping newest keystroke"
+                    );
+                    sent = true; // Mark as handled (dropped).
+                }
+            }
+        }
+        drop(workers_map);
+
+        // If not sent and no sender exists (or was removed due to closure), create one.
+        if !sent {
             let (tx, rx) = tokio::sync::mpsc::channel(RELAY_QUEUE_CAPACITY);
             let origin_key_for_worker = origin_key.clone();
             tokio::spawn(Self::relay_worker_loop(
@@ -349,16 +381,13 @@ impl App {
                 Duration::from_secs(2),
                 Duration::from_secs(1),
             ));
-            workers_map.insert(origin_key.clone(), tx.clone());
-            tx.try_send(item)
-        };
-        drop(workers_map);
 
-        if let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) = send_result {
-            warn!(
-                origin = %origin_key,
-                "relay queue full, dropping newest keystroke"
-            );
+            // Re-acquire lock to insert and send.
+            let workers = relay_workers();
+            if let Ok(mut workers_map) = workers.lock() {
+                workers_map.insert(origin_key.clone(), tx.clone());
+                let _ = tx.try_send(item);
+            }
         }
     }
 
@@ -411,6 +440,12 @@ impl App {
         // Process items from the channel.
         while let Some(item) = rx.recv().await {
             Self::send_relay_item(&origin, &item, relay_timeout).await;
+        }
+
+        // Channel closed; clean up this worker's entry so later input recreates discovery/worker.
+        let workers = relay_workers();
+        if let Ok(mut workers_map) = workers.lock() {
+            workers_map.remove(&origin_key);
         }
     }
 
