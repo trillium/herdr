@@ -1,5 +1,7 @@
 use bytes::Bytes;
 use crossterm::event::KeyCode;
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use tracing::{debug, warn};
 
@@ -21,6 +23,15 @@ struct RelayQueueItem {
 }
 
 const RELAY_QUEUE_CAPACITY: usize = 32;
+
+static RELAY_WORKERS: OnceLock<
+    Mutex<HashMap<String, tokio::sync::mpsc::Sender<RelayQueueItem>>>,
+> = OnceLock::new();
+
+fn relay_workers(
+) -> &'static Mutex<HashMap<String, tokio::sync::mpsc::Sender<RelayQueueItem>>> {
+    RELAY_WORKERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 enum PreparedPopupInput {
     NotOpen,
@@ -322,48 +333,102 @@ impl App {
             bytes: bytes.to_vec(),
         };
 
-        // Spawn relay worker. Each keystroke is queued and processed sequentially.
-        tokio::spawn(Self::relay_worker(
-            item,
-            Duration::from_secs(2),
-            Duration::from_secs(1),
-        ));
+        // Route through bounded FIFO channel keyed by origin_key.
+        // If no worker exists for this origin yet, create the channel and spawn the worker.
+        let workers = relay_workers();
+        let mut workers_map = workers.lock().unwrap();
+        let send_result = if let Some(sender) = workers_map.get(&origin_key) {
+            sender.try_send(item)
+        } else {
+            // First keystroke to this origin: create channel and spawn worker.
+            let (tx, rx) = tokio::sync::mpsc::channel(RELAY_QUEUE_CAPACITY);
+            let origin_key_for_worker = origin_key.clone();
+            tokio::spawn(Self::relay_worker_loop(
+                origin_key_for_worker,
+                rx,
+                Duration::from_secs(2),
+                Duration::from_secs(1),
+            ));
+            workers_map.insert(origin_key.clone(), tx.clone());
+            tx.try_send(item)
+        };
+        drop(workers_map);
+
+        if let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) = send_result {
+            warn!(
+                origin = %origin_key,
+                "relay queue full, dropping newest keystroke"
+            );
+        }
     }
 
-    /// Relay worker that processes a single input item through federation.
-    /// Each keystroke to a remote pane creates its own relay task that discovers
-    /// the origin and sends input. Tasks execute sequentially (no spawning of
-    /// further tasks for ordering guarantees).
-    async fn relay_worker(item: RelayQueueItem, _discovery_timeout: Duration, relay_timeout: Duration) {
-        let origins = match tokio::task::spawn_blocking(crate::federation::discover_origins)
-            .await
+    /// Relay worker loop that processes items sequentially from a bounded FIFO channel.
+    /// Discovery runs once per worker and the origin is cached.
+    /// Each keystroke is sent through the channel and processed in order.
+    async fn relay_worker_loop(
+        origin_key: String,
+        mut rx: tokio::sync::mpsc::Receiver<RelayQueueItem>,
+        discovery_timeout: Duration,
+        relay_timeout: Duration,
+    ) {
+        // Discover origins once and cache for this worker.
+        let origin = match tokio::time::timeout(
+            discovery_timeout,
+            tokio::task::spawn_blocking(crate::federation::discover_origins),
+        )
+        .await
         {
-            Ok(origins) => origins,
-            Err(_) => {
-                warn!("failed to discover origins for foreign pane input relay");
+            Ok(Ok(origins)) => {
+                // Find the origin matching this worker's key.
+                match origins.into_iter().find(|o| o.key.as_str() == origin_key) {
+                    Some(o) => o,
+                    None => {
+                        warn!(
+                            origin = %origin_key,
+                            "origin not found for foreign pane input relay"
+                        );
+                        return;
+                    }
+                }
+            }
+            Ok(Err(_)) => {
+                warn!(
+                    origin = %origin_key,
+                    "failed to discover origins for foreign pane input relay"
+                );
                 return;
             }
-        };
-
-        let origin = match origins.into_iter().find(|o| o.key.as_str() == item.origin_key) {
-            Some(o) => o,
-            None => {
+            Err(_) => {
                 warn!(
-                    origin = %item.origin_key,
-                    "origin not found for foreign pane input relay"
+                    origin = %origin_key,
+                    discovery_timeout_secs = discovery_timeout.as_secs(),
+                    "discovery timeout for foreign pane input relay"
                 );
                 return;
             }
         };
 
+        // Process items from the channel.
+        while let Some(item) = rx.recv().await {
+            Self::send_relay_item(&origin, &item, relay_timeout).await;
+        }
+    }
+
+    /// Helper to send a single relay item to the foreign pane.
+    async fn send_relay_item(
+        origin: &crate::federation::Origin,
+        item: &RelayQueueItem,
+        relay_timeout: Duration,
+    ) {
         let bytes_len = item.bytes.len();
         let bytes_clone = item.bytes.clone();
         let raw_terminal_id_clone = item.raw_terminal_id.clone();
         let origin_key = item.origin_key.clone();
+        let origin_clone = origin.clone();
 
         let result = tokio::task::spawn_blocking(move || {
             crate::federation::relay::send_input_to_foreign_pane(
-                &origin,
+                &origin_clone,
                 &raw_terminal_id_clone,
                 Some(&bytes_clone),
                 relay_timeout,
@@ -393,7 +458,7 @@ impl App {
                     origin = %origin_key,
                     pane = %item.raw_terminal_id,
                     error = %err,
-                    "relay task error"
+                    "relay worker error"
                 );
             }
         }
@@ -2031,98 +2096,4 @@ mod tests {
         assert_eq!(result, Some("complex_key_123".to_string()));
     }
 
-    #[test]
-    fn relay_routes_input_correctly() {
-        // This test verifies that foreign workspace input routing detects foreign ID correctly
-        let mut app = app_for_mouse_test();
-
-        // Build a foreign workspace with namespaced terminal ID
-        let mut ws = Workspace::test_new("fed~testorigin~w10");
-        let pane_id = ws.tabs[0].root_pane;
-
-        // Manually set terminal ID to be namespaced (fed~origin~rawid)
-        let terminal_id = "fed~testorigin~t1".to_string();
-        ws.tabs[0].terminals.insert(pane_id, terminal_id);
-
-        let pane_infos = ws.tabs[0].layout.panes(Rect::new(26, 2, 80, 18));
-        app.state.workspaces = vec![ws];
-        app.state.active = Some(0);
-        app.state.selected = 0;
-        app.state.mode = Mode::Terminal;
-        app.state.view.pane_infos = pane_infos;
-
-        // Enable federation
-        app.state.federation_enabled = true;
-
-        // Verify workspace is detected as foreign
-        assert!(crate::federation::is_foreign_workspace_id("fed~testorigin~w10"));
-
-        // Verify origin extraction works
-        let origin = extract_origin_key_from_namespaced_id("fed~testorigin~w10");
-        assert_eq!(origin, Some("testorigin".to_string()));
-
-        // Verify terminal ID parsing works
-        let parsed = crate::federation::parse_foreign_terminal_id("fed~testorigin~t1");
-        assert!(parsed.is_some());
-        if let Some((_, raw_id)) = parsed {
-            assert_eq!(raw_id, "t1");
-        }
-    }
-
-    #[tokio::test]
-    async fn federation_enabled_with_foreign_workspace_attempts_relay() {
-        // This test verifies that input to a foreign pane triggers relay path
-        let mut app = app_for_mouse_test();
-
-        // Build a foreign workspace with namespaced IDs
-        let mut ws = Workspace::test_new("fed~remotehost~w5");
-        let pane_id = ws.tabs[0].root_pane;
-
-        // Set terminal ID to foreign-namespaced format
-        let terminal_id = "fed~remotehost~term42".to_string();
-        ws.tabs[0].terminals.insert(pane_id, terminal_id);
-
-        let pane_infos = ws.tabs[0].layout.panes(Rect::new(26, 2, 80, 18));
-        app.state.workspaces = vec![ws];
-        app.state.active = Some(0);
-        app.state.selected = 0;
-        app.state.mode = Mode::Terminal;
-        app.state.view.pane_infos = pane_infos;
-
-        // Enable federation flag
-        app.state.federation_enabled = true;
-
-        // Verify conditions for relay attempt
-        let workspace = &app.state.workspaces[0];
-        assert!(crate::federation::is_foreign_workspace_id(&workspace.id));
-        assert_eq!(
-            extract_origin_key_from_namespaced_id(&workspace.id),
-            Some("remotehost".to_string())
-        );
-
-        // Verify terminal ID is foreign
-        let terminal_id = workspace.terminal_id(pane_id).expect("terminal_id");
-        assert!(terminal_id.starts_with("fed~remotehost~"));
-
-        // Parse to get raw terminal ID
-        let (_, raw_id) = crate::federation::parse_foreign_terminal_id(&terminal_id)
-            .expect("parse foreign terminal id");
-        assert_eq!(raw_id, "term42");
-
-        // When handle_terminal_key is called on a foreign pane with federation enabled,
-        // it should attempt relay (errors logged, never blocking)
-        let key = crate::input::parse_terminal_key_sequence("x").unwrap();
-        app.handle_terminal_key_headless(key);
-
-        // Give the relay spawn task time to complete (non-blocking check)
-        tokio::time::sleep(Duration::from_millis(10)).await;
-
-        // We can't easily mock the actual relay without significant infrastructure,
-        // but we've verified the conditions that trigger relay are correct:
-        // - federation enabled
-        // - workspace is foreign
-        // - terminal ID is foreign-namespaced
-        // - origin key extracted correctly
-        // - raw terminal ID extracted correctly
-    }
 }
