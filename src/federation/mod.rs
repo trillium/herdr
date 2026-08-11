@@ -18,8 +18,9 @@
 //! input or PTY relay. Phase **N1c** delivers the async snapshot poll loop
 //! ([`poll::collect_foreign_rows`] spawned in `App::spawn_federation_poll`) that
 //! fetches each remote origin's snapshot on a ~5s timer when the flag is enabled
-//! at startup and projects it live into the sidebar. The `federation.*` JSON API
-//! methods are a later phase (N1d+). The module-level allows below remain only
+//! at startup and projects it live into the sidebar. Phase **N1d** adds input
+//! relay ([`relay::send_input_to_foreign_pane`]) so typing into a foreign pane
+//! sends keystrokes to its remote PTY. The module-level allows below remain only
 //! for the still-unwired N0 surface (registry); they shrink as later phases
 //! consume it.
 #![allow(dead_code, unused_imports)]
@@ -30,6 +31,7 @@ mod namespace;
 mod origin;
 mod poll;
 mod registry;
+pub mod relay;
 
 pub use discovery::{
     discover, discover_origins, forwarded_socket_path, DiscoveryConfig, StaticOrigin,
