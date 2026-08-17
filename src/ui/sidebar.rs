@@ -1272,6 +1272,18 @@ fn render_workspace_list(
         };
 
         let label = ws.display_name_from(&app.terminals, terminal_runtimes);
+        // N2 Part 1: every workspace is labeled with its origin. Foreign rows
+        // already carry their origin prefix (set at ingest); local rows get the
+        // local hostname prefix here, gated behind the federation flag so the
+        // default (flag off) rendering is unchanged.
+        let label = if app.federation_enabled {
+            crate::federation::prefixed_workspace_label(
+                crate::federation::is_foreign_workspace_id(&ws.id),
+                &label,
+            )
+        } else {
+            label
+        };
         let display_label = if card.indented {
             grouped_child_display_label(&label, ws.branch().as_deref(), ws.custom_name.is_some())
         } else {

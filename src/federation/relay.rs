@@ -12,7 +12,7 @@ use std::time::Duration;
 use crate::api::client::{ApiClient, ApiClientError, ConnectionTarget as ApiConnectionTarget};
 use crate::api::schema::{Method, PaneSendInputParams, Request};
 
-use super::origin::{ConnectionTarget, Origin};
+use super::origin::{ConnectionTarget, Origin, OriginKey};
 
 /// Failure sending input to a foreign pane.
 #[derive(Debug)]
@@ -67,6 +67,89 @@ pub fn send_input_to_foreign_pane(
         .map_err(RelayError::Api)?;
 
     Ok(())
+}
+
+/// Send a workspace/tab/pane structure mutation to a remote origin's JSON API.
+///
+/// N2 Part 3 action routing: new-tab / split / close on a foreign workspace are
+/// executed on the owning remote server, and the resulting change comes back
+/// through the next snapshot poll rather than being applied locally. Uses the
+/// same JSON API socket as [`send_input_to_foreign_pane`]. Synchronous and
+/// blocking — run from an async context via `tokio::task::spawn_blocking`.
+pub fn send_action_to_foreign(
+    origin: &Origin,
+    method: &Method,
+    timeout: Duration,
+) -> Result<(), RelayError> {
+    let target = match &origin.target {
+        ConnectionTarget::LocalSocket(path) => ApiConnectionTarget::SocketPath(path.clone()),
+    };
+    let client = ApiClient::for_target(target);
+
+    let request = Request {
+        id: format!("federation:action:{}", origin.key),
+        method: method.clone(),
+    };
+
+    let _value = client
+        .request_value_with_timeout(&request, timeout)
+        .map_err(RelayError::Api)?;
+
+    Ok(())
+}
+
+/// Spawn a background task that discovers the origin matching `origin_key` and
+/// sends `method` to it, fire-and-forget. The response and any error are
+/// logged, never surfaced to the caller — matching the N1d input-relay posture
+/// so a structure action never blocks the UI thread.
+pub fn spawn_send_action_to_foreign(origin_key: OriginKey, method: Method, timeout: Duration) {
+    tokio::spawn(async move {
+        let origins = match tokio::task::spawn_blocking(crate::federation::discover_origins).await {
+            Ok(origins) => origins,
+            Err(err) => {
+                tracing::warn!(
+                    origin = %origin_key,
+                    error = %err,
+                    "federation action: origin discovery failed"
+                );
+                return;
+            }
+        };
+        let Some(origin) = origins.into_iter().find(|o| o.key == origin_key) else {
+            tracing::warn!(
+                origin = %origin_key,
+                "federation action: origin not found"
+            );
+            return;
+        };
+
+        let origin_for_send = origin.clone();
+        let method_for_send = method.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            send_action_to_foreign(&origin_for_send, &method_for_send, timeout)
+        })
+        .await;
+
+        match result {
+            Ok(Ok(())) => {
+                tracing::debug!(origin = %origin.key, "federation action routed to origin");
+            }
+            Ok(Err(err)) => {
+                tracing::warn!(
+                    origin = %origin.key,
+                    error = %err,
+                    "federation action failed"
+                );
+            }
+            Err(err) => {
+                tracing::warn!(
+                    origin = %origin.key,
+                    error = %err,
+                    "federation action task panicked"
+                );
+            }
+        }
+    });
 }
 
 #[cfg(test)]
@@ -170,5 +253,23 @@ mod tests {
             "test",
         )));
         let _: &dyn Error = &api_err;
+    }
+
+    #[test]
+    fn action_relay_unreachable_remote_returns_api_error() {
+        let origin = test_origin("nDOWN");
+        let method = Method::TabCreate(crate::api::schema::TabCreateParams {
+            workspace_id: Some("w1".to_string()),
+            cwd: None,
+            focus: true,
+            label: None,
+            env: Default::default(),
+        });
+        let result = send_action_to_foreign(&origin, &method, Duration::from_millis(50));
+        assert!(result.is_err());
+        match result {
+            Err(RelayError::Api(_)) => (),
+            _ => panic!("expected Api error for unreachable socket"),
+        }
     }
 }
