@@ -79,6 +79,16 @@ pub fn is_foreign_workspace_id(id: &str) -> bool {
     parse_foreign_public_id(id).is_some()
 }
 
+/// Split a namespaced foreign workspace id back into `(origin, raw workspace id)`.
+///
+/// The workspace-id counterpart of [`parse_foreign_terminal_id`]. Used by
+/// action routing (N2 Part 3) to recover the remote's raw workspace id so a
+/// structure mutation can be sent back to the owning origin. Returns `None` for
+/// local ids and malformed namespaced ids.
+pub fn parse_foreign_workspace_id(id: &str) -> Option<(OriginKey, &str)> {
+    parse_foreign_public_id(id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -149,6 +159,22 @@ mod tests {
             assert!(parse_foreign_terminal_id(&id).is_none(), "{malformed}");
             assert!(!is_foreign(&id), "{malformed}");
         }
+    }
+
+    #[test]
+    fn parse_foreign_workspace_id_recovers_raw_id() {
+        // Action routing (N2 Part 3) strips the origin namespace to recover the
+        // remote's raw workspace id so a structure mutation targets the remote.
+        let origin = OriginKey::new("mini1").unwrap();
+        let foreign = namespace_public_id(&origin, "w7");
+        assert_eq!(foreign, "fed~mini1~w7");
+        let (parsed, raw) = parse_foreign_workspace_id(&foreign).expect("foreign workspace id");
+        assert_eq!(parsed, origin);
+        assert_eq!(raw, "w7");
+
+        // Local ids and malformed namespaced ids are not foreign.
+        assert!(parse_foreign_workspace_id("w7").is_none());
+        assert!(parse_foreign_workspace_id("fed~mini1").is_none());
     }
 
     #[test]

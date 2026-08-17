@@ -27,6 +27,8 @@
 
 mod discovery;
 mod ingest;
+mod label;
+mod live_view;
 mod namespace;
 mod origin;
 mod poll;
@@ -38,9 +40,11 @@ pub use discovery::{
     TailscaleStatus,
 };
 pub use ingest::{foreign_rows, ForeignRows, IngestError, RemoteSnapshot};
+pub use label::{local_origin_prefix, origin_label_prefix, prefixed_workspace_label};
+pub use live_view::{live_view_status, LiveViewStatus};
 pub use namespace::{
     is_foreign, is_foreign_workspace_id, namespace_public_id, namespace_terminal_id,
-    parse_foreign_terminal_id,
+    parse_foreign_terminal_id, parse_foreign_workspace_id,
 };
 pub use origin::{ConnectionTarget, InvalidOriginKey, Origin, OriginKey};
 pub use poll::collect_foreign_rows;

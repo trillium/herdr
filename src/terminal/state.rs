@@ -144,6 +144,15 @@ pub struct TerminalState {
     pub revision: u64,
     pub launch_argv: Option<Vec<String>>,
     pub respawn_shell_on_exit: bool,
+    /// For a federated (foreign) terminal, the raw remote public pane id (e.g.
+    /// `w1:p1`) on the owning origin. Used by N2 action routing to send split/
+    /// close back to the remote pane. `None` for local terminals.
+    pub foreign_remote_pane_id: Option<String>,
+    /// For a federated (foreign) terminal, the owning origin's reported wire
+    /// protocol version (advisory, from the last snapshot). Drives the N2 live
+    /// view compatibility status. `None` for local terminals and when the
+    /// origin did not report a protocol.
+    pub foreign_remote_protocol: Option<u32>,
     recent_agent_process_exit: Option<RecentAgentProcessExit>,
     agent_process_acquisition_pending: bool,
     pub pending_agent_resume_plan: Option<crate::agent_resume::AgentResumePlan>,
@@ -178,6 +187,8 @@ impl TerminalState {
             revision: 0,
             launch_argv: None,
             respawn_shell_on_exit: false,
+            foreign_remote_pane_id: None,
+            foreign_remote_protocol: None,
             recent_agent_process_exit: None,
             agent_process_acquisition_pending: false,
             pending_agent_resume_plan: None,

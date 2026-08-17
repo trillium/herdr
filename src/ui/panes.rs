@@ -406,10 +406,54 @@ pub(super) fn render_panes(
                 true,
             );
             render_copy_mode_cursor(app, frame, info);
+        } else {
+            // A pane with no local runtime. Foreign (federated) panes are
+            // projected read-only, so render the live-view status placeholder in
+            // place of a blank grid instead of crashing or leaving the pane empty.
+            if app.federation_enabled {
+                render_foreign_live_view_placeholder(app, ws, info, frame);
+            }
         }
     }
 
     render_pane_borders(app, ws, pane_infos, split_borders, frame);
+}
+
+/// Render the N2 live-view status for a foreign pane (no local runtime): the
+/// origin label plus the protocol-compatibility status, so a protocol mismatch
+/// is a visible, non-crash state rather than a silently blank pane.
+fn render_foreign_live_view_placeholder(
+    app: &AppState,
+    ws: &crate::workspace::Workspace,
+    info: &PaneInfo,
+    frame: &mut Frame,
+) {
+    let Some(terminal_id) = ws.terminal_id(info.id) else {
+        return;
+    };
+    if !crate::federation::is_foreign(terminal_id) {
+        return;
+    }
+
+    let status = app
+        .terminals
+        .get(terminal_id)
+        .map(|terminal| crate::federation::live_view_status(terminal.foreign_remote_protocol))
+        .unwrap_or(crate::federation::LiveViewStatus::UnknownRemoteProtocol);
+
+    let origin = ws
+        .custom_name
+        .as_deref()
+        .and_then(|name| name.split(':').next())
+        .filter(|label| !label.is_empty())
+        .unwrap_or("remote");
+
+    let message = format!("{origin}: {}", status.message());
+    let paragraph = Paragraph::new(message)
+        .style(Style::default().fg(app.palette.subtext0))
+        .wrap(ratatui::widgets::Wrap { trim: false });
+    frame.render_widget(Clear, info.inner_rect);
+    frame.render_widget(paragraph, info.inner_rect);
 }
 
 pub(crate) fn popup_pane_rects(app: &AppState, area: Rect) -> Option<(Rect, Rect)> {

@@ -282,7 +282,7 @@ pub fn foreign_rows(origin: &Origin, snap: &RemoteSnapshot) -> ForeignRows {
             );
             continue;
         }
-        let Some((terminal_id, terminal)) = build_terminal(&origin.key, pane) else {
+        let Some((terminal_id, terminal)) = build_terminal(&origin.key, pane, snap.protocol) else {
             continue;
         };
         terminals.push((terminal_id.clone(), terminal));
@@ -344,6 +344,7 @@ fn merge_pane_universe(snap: &RemoteSnapshot) -> Vec<RemotePane> {
 fn build_terminal(
     origin_key: &OriginKey,
     pane: &RemotePane,
+    remote_protocol: u32,
 ) -> Option<(TerminalId, TerminalState)> {
     let raw = pane.terminal_id.trim();
     if raw.is_empty() {
@@ -360,6 +361,13 @@ fn build_terminal(
     let cwd = PathBuf::from(pane.cwd.as_deref().unwrap_or_default());
     let mut terminal = TerminalState::new(namespaced.clone(), cwd);
     terminal.state = agent_state_from_status(&pane.agent_status);
+    // Retain the remote's raw public pane id so N2 action routing can target the
+    // exact pane on the origin (untrusted, display/id only).
+    terminal.foreign_remote_pane_id =
+        (!pane.pane_id.trim().is_empty()).then(|| pane.pane_id.clone());
+    // Retain the origin's reported wire protocol for the N2 live-view status.
+    // A zero protocol is the `#[serde(default)]` sentinel for "not reported".
+    terminal.foreign_remote_protocol = (remote_protocol != 0).then_some(remote_protocol);
     if let Some(agent) = pane.agent.as_deref() {
         // Unrecognized agent labels leave detected_agent None but still yield a
         // valid foreign terminal.
@@ -524,21 +532,23 @@ fn build_tab(
     }
 }
 
-/// Origin-labeled workspace display name. Reads as `"{origin}/{remote label}"`
-/// when the remote workspace has a label, otherwise just the origin label (or
-/// the raw workspace id if the origin label is empty). Untrusted strings.
+/// Origin-labeled workspace display name. Reads as `"{5-char origin}:{remote
+/// label}"` when the remote workspace has a label, otherwise just the 5-char
+/// origin label (or the raw workspace id if the origin label is empty).
+/// Untrusted strings; the origin segment is truncated by characters.
 fn workspace_label(origin: &Origin, remote: Option<&RemoteWorkspace>, ws_id: &str) -> String {
-    let base = if origin.label.trim().is_empty() {
-        ws_id
+    let base = crate::federation::origin_label_prefix(&origin.label);
+    let base = if base.is_empty() {
+        ws_id.to_string()
     } else {
-        origin.label.as_str()
+        base
     };
     match remote
         .map(|workspace| workspace.label.trim())
         .filter(|label| !label.is_empty())
     {
-        Some(remote_label) => format!("{base}/{remote_label}"),
-        None => base.to_string(),
+        Some(remote_label) => format!("{base}:{remote_label}"),
+        None => base,
     }
 }
 
@@ -652,7 +662,7 @@ mod tests {
         let ws = &rows.workspaces[0];
         assert_eq!(ws.tabs.len(), 2);
         // Origin-labeled workspace name and namespaced id.
-        assert_eq!(ws.custom_name.as_deref(), Some("mini2/repo"));
+        assert_eq!(ws.custom_name.as_deref(), Some("mini2:repo"));
         assert_eq!(ws.id, "fed~n7~w1");
         // active_tab_id "w1:t2" resolves to the second tab.
         assert_eq!(ws.active_tab, 1);
@@ -668,6 +678,10 @@ mod tests {
         assert_eq!(term_a.detected_agent, Some(Agent::Claude));
         assert_eq!(term_a.agent_name.as_deref(), Some("my-agent"));
         assert_eq!(term_a.manual_label.as_deref(), Some("my-agent"));
+        // N2 Part 3: the remote's raw pane id and protocol are retained for
+        // action routing and live-view status.
+        assert_eq!(term_a.foreign_remote_pane_id.as_deref(), Some("w1:p1"));
+        assert_eq!(term_a.foreign_remote_protocol, Some(16));
 
         // The blocked/idle-only second pane maps its status straight through.
         let term_b = rows
@@ -678,6 +692,22 @@ mod tests {
             .expect("term_b present");
         assert_eq!(term_b.state, AgentState::Idle);
         assert_eq!(term_b.detected_agent, None);
+    }
+
+    #[test]
+    fn workspace_label_truncates_origin_to_five_chars() {
+        // A long origin label is truncated to its first five characters and the
+        // remote workspace label follows the colon separator.
+        let body = r#"{"result":{"snapshot":{
+            "protocol":20,
+            "workspaces":[{"workspace_id":"w1","label":"FM","active_tab_id":"w1:t1"}],
+            "tabs":[{"tab_id":"w1:t1","workspace_id":"w1","label":"main"}],
+            "agents":[
+                {"pane_id":"w1:p1","tab_id":"w1:t1","workspace_id":"w1","terminal_id":"term_a","agent_status":"idle"}
+            ]
+        }}}"#;
+        let rows = map(body, "n1", "macbook");
+        assert_eq!(rows.workspaces[0].custom_name.as_deref(), Some("macbo:FM"));
     }
 
     #[test]
