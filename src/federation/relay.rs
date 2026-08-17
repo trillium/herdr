@@ -102,9 +102,18 @@ pub fn send_action_to_foreign(
 /// sends `method` to it, fire-and-forget. The response and any error are
 /// logged, never surfaced to the caller — matching the N1d input-relay posture
 /// so a structure action never blocks the UI thread.
-pub fn spawn_send_action_to_foreign(origin_key: OriginKey, method: Method, timeout: Duration) {
+pub fn spawn_send_action_to_foreign(
+    origin_key: OriginKey,
+    method: Method,
+    timeout: Duration,
+    config_socket_dir: Option<std::path::PathBuf>,
+) {
     tokio::spawn(async move {
-        let origins = match tokio::task::spawn_blocking(crate::federation::discover_origins).await {
+        let origins = match tokio::task::spawn_blocking(move || {
+            crate::federation::discover_origins(config_socket_dir.as_deref())
+        })
+        .await
+        {
             Ok(origins) => origins,
             Err(err) => {
                 tracing::warn!(
