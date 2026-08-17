@@ -228,6 +228,14 @@ fn output_within(command: &mut Command, timeout: Duration, label: &str) -> Optio
     use std::process::Stdio;
     use std::time::Instant;
 
+    // Create a new process group so we can kill the entire tree (sh + children)
+    // on timeout, avoiding orphaned grandchild processes holding stdout pipes open.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+
     let mut child = match command.stdout(Stdio::piped()).stderr(Stdio::null()).spawn() {
         Ok(child) => child,
         Err(err) => {
@@ -253,7 +261,19 @@ fn output_within(command: &mut Command, timeout: Duration, label: &str) -> Optio
             Ok(Some(status)) => break status,
             Ok(None) => {
                 if Instant::now() >= deadline {
-                    let _ = child.kill();
+                    // Kill the entire process group (sh + all children) to avoid
+                    // orphaned grandchild processes holding the stdout pipe open.
+                    #[cfg(unix)]
+                    {
+                        let pid = child.id() as i32;
+                        unsafe {
+                            libc::killpg(pid, libc::SIGKILL);
+                        }
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        let _ = child.kill();
+                    }
                     let _ = child.wait();
                     let _ = reader.join();
                     tracing::debug!(
@@ -265,7 +285,17 @@ fn output_within(command: &mut Command, timeout: Duration, label: &str) -> Optio
                 std::thread::sleep(Duration::from_millis(20));
             }
             Err(err) => {
-                let _ = child.kill();
+                #[cfg(unix)]
+                {
+                    let pid = child.id() as i32;
+                    unsafe {
+                        libc::killpg(pid, libc::SIGKILL);
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = child.kill();
+                }
                 let _ = child.wait();
                 let _ = reader.join();
                 tracing::debug!(%err, command = label, "federation discovery: subprocess wait failed");
