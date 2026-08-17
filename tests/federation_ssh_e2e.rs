@@ -9,7 +9,7 @@
 mod support;
 
 use std::fs;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::os::unix::net::UnixStream;
@@ -47,14 +47,14 @@ fn federation_protocol_gating_with_remote_attach() {
 
     let root = unique_test_dir();
     let binary = PathBuf::from(env!("CARGO_BIN_EXE_herdr"));
-    let mut ssh = LocalSshd::start(root.clone(), &binary);
+    let ssh = LocalSshd::start(root.clone(), &binary);
 
     // --- Remote server setup ---
     // Start a herdr server in the SSH-isolated environment. Use an explicit
     // HERDR_SOCKET_PATH so we know exactly where its API socket lands.
     let remote_socket = root.join("remote-api.sock");
     let remote_client_socket = root.join("remote-api-client.sock");
-    let remote_api = RemoteServer::start(&ssh, &binary, &remote_socket, &remote_client_socket);
+    let _remote_api = RemoteServer::start(&ssh, &binary, &remote_socket, &remote_client_socket);
     wait_for_socket(&remote_socket, Duration::from_secs(10));
 
     // Create a workspace on the remote with a known label.
@@ -264,7 +264,6 @@ fn federation_protocol_gating_with_remote_attach() {
         json!({"id":"stop-local","method":"server.stop","params":{}}),
     );
     server.wait_for_exit(Duration::from_secs(10));
-    drop(remote_api);
     ssh.stop_remote_server();
 }
 
