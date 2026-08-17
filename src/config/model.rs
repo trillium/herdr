@@ -1015,6 +1015,16 @@ pub struct ExperimentalConfig {
     /// immediately; enabling takes effect at the next launch. Default: false.
     /// See `src/federation/`.
     pub federation: bool,
+    /// Directory to look for forwarded federation API sockets from remote herdr
+    /// servers (e.g. via SSH socket forwarding). When set, used as the primary
+    /// source for `forwarded_socket_path()` before `HERDR_FEDERATION_SOCKET_DIR`
+    /// and the default `/tmp/herdr-federation/`. Tilde expansion is performed
+    /// at startup.
+    ///
+    /// Example: `"~/.config/herdr/federation-sockets"`
+    ///
+    /// Default: None (fall back to env var or default temp dir).
+    pub federation_socket_dir: Option<String>,
 }
 
 impl Default for KeysConfig {

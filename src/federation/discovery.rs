@@ -200,9 +200,14 @@ fn parse_static_origins(raw: &str) -> Vec<StaticOrigin> {
 /// [`STATIC_ORIGINS_ENV`] and the forwarded-socket dir from [`SOCKET_DIR_ENV`]
 /// (or a default). This is the N1c "static override" seam; a future config-model
 /// surface can replace it without touching [`discover`].
-pub fn discovery_config_from_env() -> DiscoveryConfig {
-    let forwarded_socket_dir = std::env::var_os(SOCKET_DIR_ENV)
+///
+/// `config_socket_dir` is an optional override from the config model
+/// (`experimental.federation_socket_dir`). When present it takes priority over
+/// the env var.
+pub fn discovery_config_from_env(config_socket_dir: Option<&std::path::Path>) -> DiscoveryConfig {
+    let forwarded_socket_dir = config_socket_dir
         .map(PathBuf::from)
+        .or_else(|| std::env::var_os(SOCKET_DIR_ENV).map(PathBuf::from))
         .unwrap_or_else(default_forwarded_socket_dir);
     let static_origins = std::env::var(STATIC_ORIGINS_ENV)
         .ok()
@@ -342,8 +347,12 @@ pub fn tailscale_status() -> Option<TailscaleStatus> {
 /// via [`tailscale_status`]) unioned with static env overrides. Static origins
 /// win on key conflict. Synchronous (spawns the `tailscale` subprocess); call
 /// off the async reactor.
-pub fn discover_origins() -> Vec<Origin> {
-    let config = discovery_config_from_env();
+///
+/// `config_socket_dir` is an optional override from the config model
+/// (`experimental.federation_socket_dir`). When present it takes priority over
+/// the `HERDR_FEDERATION_SOCKET_DIR` env var.
+pub fn discover_origins(config_socket_dir: Option<&std::path::Path>) -> Vec<Origin> {
+    let config = discovery_config_from_env(config_socket_dir);
     let status = tailscale_status().unwrap_or(TailscaleStatus {
         self_node: None,
         peers: HashMap::new(),

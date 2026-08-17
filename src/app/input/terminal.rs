@@ -532,11 +532,13 @@ impl App {
         if !sent {
             let (tx, rx) = tokio::sync::mpsc::channel(RELAY_QUEUE_CAPACITY);
             let origin_key_for_worker = origin_key.clone();
+            let config_socket_dir = self.federation_socket_dir.clone();
             tokio::spawn(Self::relay_worker_loop(
                 origin_key_for_worker,
                 rx,
                 Duration::from_secs(2),
                 Duration::from_secs(1),
+                config_socket_dir,
             ));
 
             // Re-acquire lock to insert and send.
@@ -556,11 +558,14 @@ impl App {
         mut rx: tokio::sync::mpsc::Receiver<RelayQueueItem>,
         discovery_timeout: Duration,
         relay_timeout: Duration,
+        config_socket_dir: Option<std::path::PathBuf>,
     ) {
         // Discover origins once and cache for this worker.
         let origin = match tokio::time::timeout(
             discovery_timeout,
-            tokio::task::spawn_blocking(crate::federation::discover_origins),
+            tokio::task::spawn_blocking(move || {
+                crate::federation::discover_origins(config_socket_dir.as_deref())
+            }),
         )
         .await
         {

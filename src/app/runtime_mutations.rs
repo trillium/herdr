@@ -68,6 +68,7 @@ impl App {
             origin_key,
             method,
             FOREIGN_ACTION_TIMEOUT,
+            self.federation_socket_dir.clone(),
         );
     }
 

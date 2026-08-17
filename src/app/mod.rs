@@ -182,6 +182,9 @@ pub struct App {
     /// `experimental.federation` was enabled at startup. `None` means no polling
     /// and therefore no federation network I/O.
     pub(crate) federation_poll: Option<FederationPollHandle>,
+    /// Resolved `federation_socket_dir` from the config, passed to
+    /// [`crate::federation::discover_origins`] at each discovery call.
+    pub(crate) federation_socket_dir: Option<std::path::PathBuf>,
 }
 
 /// Lifecycle handle for the background federation snapshot poll task.
@@ -844,6 +847,11 @@ impl App {
             foreign_rows_tx,
             foreign_rows_rx,
             federation_poll: None,
+            federation_socket_dir: config
+                .experimental
+                .federation_socket_dir
+                .as_deref()
+                .map(crate::worktree::expand_tilde_path),
         };
         app.configure_tab_bar_status(&config.ui.tab_bar_right, &config.ui.tab_bar_right_separator);
         app.configure_window_title(&config.ui.window_title);
@@ -988,10 +996,13 @@ impl App {
         let shutdown = Arc::new(Notify::new());
         let task_shutdown = shutdown.clone();
         let tx = self.foreign_rows_tx.clone();
+        let config_socket_dir = self.federation_socket_dir.clone();
         let task = tokio::spawn(async move {
             // Discover origins once at task start (subprocess: off the reactor).
-            let origins = match tokio::task::spawn_blocking(crate::federation::discover_origins)
-                .await
+            let origins = match tokio::task::spawn_blocking(move || {
+                crate::federation::discover_origins(config_socket_dir.as_deref())
+            })
+            .await
             {
                 Ok(origins) => origins,
                 Err(err) => {
