@@ -8730,6 +8730,10 @@ next_tab = ""
 
     #[test]
     fn semantic_client_input_events_route_through_app_input() {
+        // Completing onboarding calls update_config_file, which writes to the
+        // process-global config path. Hold the config env lock so this cannot
+        // clobber the config file of a test that owns CONFIG_PATH_ENV_VAR.
+        let _lock = crate::config::test_config_env_lock().lock().unwrap();
         let mut server = test_headless_server();
         server.app.state.mode = crate::app::Mode::Onboarding;
         server.clients.insert(
