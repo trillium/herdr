@@ -191,6 +191,10 @@ pub struct App {
     /// Dropping a handle aborts the observer.
     pub(crate) foreign_observers:
         HashMap<crate::terminal::TerminalId, crate::federation::ForeignObserveHandle>,
+    /// Delta-aware registry of federated origins (N4). Reconciled on every
+    /// discovery pass; provides add/update/remove semantics so removed origins
+    /// can be cleaned up proactively rather than waiting for the next rows tick.
+    pub(crate) federation_registry: crate::federation::FederationRegistry,
     /// Origins discovered by the federation poll task, stored here so
     /// `reconcile_foreign_observers` can look up API sockets without
     /// re-discovering.
@@ -871,6 +875,7 @@ impl App {
             foreign_frame_tx,
             foreign_frame_rx,
             foreign_observers: HashMap::new(),
+            federation_registry: crate::federation::FederationRegistry::new(),
             federation_origins: Vec::new(),
             federation_poll: None,
             federation_socket_dir: config
@@ -1191,6 +1196,23 @@ impl App {
             .retain(|terminal_id, _| attachable.contains(terminal_id));
     }
 
+    /// Drop all observer handles and evict all cached frames belonging to
+    /// origins that the registry just removed from the discovered set.
+    fn drop_observers_for_removed_origins(&mut self, removed: &[crate::federation::OriginKey]) {
+        for origin_key in removed {
+            self.foreign_observers.retain(|terminal_id, _| {
+                crate::federation::parse_foreign_terminal_id(terminal_id)
+                    .map(|(key, _)| key != *origin_key)
+                    .unwrap_or(true)
+            });
+            self.state.foreign_frames.retain(|terminal_id, _| {
+                crate::federation::parse_foreign_terminal_id(terminal_id)
+                    .map(|(key, _)| key != *origin_key)
+                    .unwrap_or(true)
+            });
+        }
+    }
+
     pub async fn run(&mut self, terminal: &mut DefaultTerminal) -> io::Result<()> {
         if self.input_rx.is_none() {
             self.input_rx = Some(crate::raw_input::spawn_input_reader());
@@ -1464,7 +1486,14 @@ impl App {
                 LoopEvent::ForeignRows(
                     crate::federation::ForeignRowsMessage::OriginsDiscovered(origins),
                 ) => {
-                    self.federation_origins = origins;
+                    let delta = self.federation_registry.reconcile(origins);
+                    self.federation_origins = self.federation_registry.iter().cloned().collect();
+                    // Proactively drop observers and evict frames for origins
+                    // that disappeared from discovery so cleanup doesn't wait
+                    // for the next rows tick.
+                    if !delta.removed.is_empty() {
+                        self.drop_observers_for_removed_origins(&delta.removed);
+                    }
                 }
                 LoopEvent::ForeignRows(crate::federation::ForeignRowsMessage::Rows(rows)) => {
                     // The flag-gated seam replaces the foreign projection when

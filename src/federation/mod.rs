@@ -20,9 +20,11 @@
 //! fetches each remote origin's snapshot on a ~5s timer when the flag is enabled
 //! at startup and projects it live into the sidebar. Phase **N1d** adds input
 //! relay ([`relay::send_input_to_foreign_pane`]) so typing into a foreign pane
-//! sends keystrokes to its remote PTY. The module-level allows below remain only
-//! for the still-unwired N0 surface (registry); they shrink as later phases
-//! consume it.
+//! sends keystrokes to its remote PTY. The N0 [`registry`] is now wired into
+//! the run loop via [`FederationRegistry`]: each discovery pass reconciles the
+//! known origin set and proactively drops observers/frames for removed origins.
+// Re-exports and ingest/poll internals not yet consumed by the binary directly;
+// dead-code lints suppressed intentionally — public API surface, not dead code.
 #![allow(dead_code, unused_imports)]
 
 mod discovery;
