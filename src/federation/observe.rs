@@ -145,7 +145,7 @@ fn run_observer_session(
             cell_height_px: 0,
             requested_encoding: RenderEncoding::SemanticFrame,
             keybindings: ClientKeybindings::Server,
-            launch_mode: ClientLaunchMode::App,
+            launch_mode: ClientLaunchMode::TerminalAttach,
         },
     )
     .map_err(ObserveSessionError::Framing)?;
