@@ -254,3 +254,41 @@ impl std::fmt::Display for ObserveSessionError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn observe_session_error_display_variants() {
+        let connect = ObserveSessionError::Connect(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no such socket",
+        ));
+        assert!(connect.to_string().contains("connect failed"), "{connect}");
+
+        let framing = ObserveSessionError::Framing(FramingError::UnexpectedEof);
+        assert!(framing.to_string().contains("framing error"), "{framing}");
+
+        let rejected = ObserveSessionError::Rejected("bad".to_string());
+        assert!(
+            rejected.to_string().contains("server rejected"),
+            "{rejected}"
+        );
+
+        let mismatch = ObserveSessionError::ProtocolMismatch {
+            remote: 5,
+            local: 20,
+        };
+        let mismatch = mismatch.to_string();
+        assert!(mismatch.contains("protocol mismatch"), "{mismatch}");
+        assert!(mismatch.contains('5'), "{mismatch}");
+        assert!(mismatch.contains("20"), "{mismatch}");
+
+        let unexpected = ObserveSessionError::UnexpectedMessage("wat".to_string());
+        assert!(
+            unexpected.to_string().contains("unexpected message"),
+            "{unexpected}"
+        );
+    }
+}

@@ -6983,4 +6983,214 @@ last_pane = "prefix+tab"
             b"a"
         );
     }
+
+    fn federation_test_origin(key: &str) -> crate::federation::Origin {
+        crate::federation::Origin::new(
+            crate::federation::OriginKey::new(key).expect("valid test origin key"),
+            "test-machine",
+            crate::federation::ConnectionTarget::LocalSocket(std::path::PathBuf::from(
+                "/nonexistent/herdr-n3-test.sock",
+            )),
+        )
+    }
+
+    fn insert_foreign_terminal(
+        app: &mut App,
+        origin_key: &crate::federation::OriginKey,
+        raw_id: &str,
+        remote_protocol: Option<u32>,
+    ) -> crate::terminal::TerminalId {
+        let namespaced = crate::federation::namespace_terminal_id(
+            origin_key,
+            &crate::terminal::TerminalId::from_string(raw_id),
+        );
+        let mut terminal = crate::terminal::TerminalState::new(
+            namespaced.clone(),
+            std::path::PathBuf::from("/tmp"),
+        );
+        terminal.foreign_remote_protocol = remote_protocol;
+        app.state.terminals.insert(namespaced.clone(), terminal);
+        namespaced
+    }
+
+    fn empty_test_frame() -> crate::protocol::FrameData {
+        crate::protocol::FrameData {
+            cells: Vec::new(),
+            width: 0,
+            height: 0,
+            cursor: None,
+            hyperlinks: Vec::new(),
+            graphics: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn federation_disabled_skips_reconcile() {
+        let mut app = test_app();
+        let origin = federation_test_origin("nTEST");
+        insert_foreign_terminal(
+            &mut app,
+            &origin.key,
+            "term_1",
+            Some(crate::protocol::PROTOCOL_VERSION),
+        );
+        app.federation_origins = vec![origin];
+        app.state.federation_enabled = false;
+
+        app.reconcile_foreign_observers();
+
+        assert!(
+            app.foreign_observers.is_empty(),
+            "no observers may be spawned while federation is disabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_origins_skips_reconcile() {
+        let mut app = test_app();
+        let origin_key = crate::federation::OriginKey::new("nTEST").expect("valid test origin key");
+        insert_foreign_terminal(
+            &mut app,
+            &origin_key,
+            "term_1",
+            Some(crate::protocol::PROTOCOL_VERSION),
+        );
+        app.federation_origins = Vec::new();
+        app.state.federation_enabled = true;
+
+        app.reconcile_foreign_observers();
+
+        assert!(
+            app.foreign_observers.is_empty(),
+            "no observers may be spawned without a discovered origin"
+        );
+    }
+
+    #[tokio::test]
+    async fn version_mismatch_terminal_not_observed() {
+        let mut app = test_app();
+        let origin = federation_test_origin("nTEST");
+        insert_foreign_terminal(
+            &mut app,
+            &origin.key,
+            "term_1",
+            Some(crate::protocol::PROTOCOL_VERSION - 1),
+        );
+        app.federation_origins = vec![origin];
+        app.state.federation_enabled = true;
+
+        app.reconcile_foreign_observers();
+
+        assert!(
+            app.foreign_observers.is_empty(),
+            "a protocol-mismatched remote must not get a live observer"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_protocol_terminal_not_observed() {
+        let mut app = test_app();
+        let origin = federation_test_origin("nTEST");
+        insert_foreign_terminal(&mut app, &origin.key, "term_1", None);
+        app.federation_origins = vec![origin];
+        app.state.federation_enabled = true;
+
+        app.reconcile_foreign_observers();
+
+        assert!(
+            app.foreign_observers.is_empty(),
+            "an unknown remote protocol must not get a live observer"
+        );
+    }
+
+    #[tokio::test]
+    async fn attachable_terminal_spawns_observer() {
+        let mut app = test_app();
+        let origin = federation_test_origin("nTEST");
+        let terminal_id = insert_foreign_terminal(
+            &mut app,
+            &origin.key,
+            "term_1",
+            Some(crate::protocol::PROTOCOL_VERSION),
+        );
+        app.federation_origins = vec![origin];
+        app.state.federation_enabled = true;
+
+        app.reconcile_foreign_observers();
+
+        assert_eq!(app.foreign_observers.len(), 1);
+        assert!(app.foreign_observers.contains_key(&terminal_id));
+    }
+
+    #[tokio::test]
+    async fn second_reconcile_does_not_double_spawn() {
+        let mut app = test_app();
+        let origin = federation_test_origin("nTEST");
+        let terminal_id = insert_foreign_terminal(
+            &mut app,
+            &origin.key,
+            "term_1",
+            Some(crate::protocol::PROTOCOL_VERSION),
+        );
+        app.federation_origins = vec![origin];
+        app.state.federation_enabled = true;
+
+        app.reconcile_foreign_observers();
+        app.reconcile_foreign_observers();
+
+        assert_eq!(app.foreign_observers.len(), 1);
+        assert!(app.foreign_observers.contains_key(&terminal_id));
+    }
+
+    #[tokio::test]
+    async fn non_attachable_terminal_drops_existing_observer() {
+        let mut app = test_app();
+        let origin = federation_test_origin("nTEST");
+        let terminal_id = insert_foreign_terminal(
+            &mut app,
+            &origin.key,
+            "term_1",
+            Some(crate::protocol::PROTOCOL_VERSION),
+        );
+        app.federation_origins = vec![origin];
+        app.state.federation_enabled = true;
+        app.reconcile_foreign_observers();
+        assert_eq!(app.foreign_observers.len(), 1, "observer spawned first");
+
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .expect("foreign terminal present")
+            .foreign_remote_protocol = Some(crate::protocol::PROTOCOL_VERSION - 1);
+        app.reconcile_foreign_observers();
+
+        assert!(
+            app.foreign_observers.is_empty(),
+            "observer must be dropped once the remote stops being attachable"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_foreign_frames_evicted() {
+        let mut app = test_app();
+        let origin = federation_test_origin("nTEST");
+        let terminal_id = insert_foreign_terminal(
+            &mut app,
+            &origin.key,
+            "term_1",
+            Some(crate::protocol::PROTOCOL_VERSION - 1),
+        );
+        app.federation_origins = vec![origin];
+        app.state.federation_enabled = true;
+        app.state
+            .foreign_frames
+            .insert(terminal_id.clone(), empty_test_frame());
+
+        app.reconcile_foreign_observers();
+
+        assert!(
+            app.state.foreign_frames.is_empty(),
+            "cached frames for a non-attachable terminal must be evicted"
+        );
+    }
 }

@@ -806,4 +806,66 @@ mod tests {
         assert!(rows.terminals.is_empty());
         assert!(rows.workspaces.is_empty());
     }
+
+    fn single_pane_snapshot(protocol_field: &str) -> String {
+        format!(
+            r#"{{"result":{{"snapshot":{{
+            {protocol_field}
+            "agents":[
+                {{"pane_id":"w1:p1","tab_id":"w1:t1","workspace_id":"w1","terminal_id":"term_1","agent_status":"idle"}}
+            ]
+        }}}}}}"#
+        )
+    }
+
+    fn only_terminal(rows: &ForeignRows) -> &TerminalState {
+        assert_eq!(rows.terminals.len(), 1);
+        &rows.terminals[0].1
+    }
+
+    #[test]
+    fn zero_protocol_maps_to_none() {
+        let rows = map(&single_pane_snapshot(r#""protocol":0,"#), "n1", "mini");
+        assert_eq!(only_terminal(&rows).foreign_remote_protocol, None);
+    }
+
+    #[test]
+    fn absent_protocol_maps_to_none() {
+        let rows = map(&single_pane_snapshot(""), "n1", "mini");
+        assert_eq!(only_terminal(&rows).foreign_remote_protocol, None);
+    }
+
+    #[test]
+    fn matching_protocol_maps_to_attachable() {
+        let protocol = crate::protocol::PROTOCOL_VERSION;
+        let rows = map(
+            &single_pane_snapshot(&format!(r#""protocol":{protocol},"#)),
+            "n1",
+            "mini",
+        );
+        let terminal = only_terminal(&rows);
+        assert_eq!(terminal.foreign_remote_protocol, Some(protocol));
+        assert_eq!(
+            crate::federation::live_view_status(terminal.foreign_remote_protocol),
+            crate::federation::LiveViewStatus::Attachable
+        );
+    }
+
+    #[test]
+    fn mismatched_protocol_chain_produces_version_mismatch_message() {
+        let rows = map(&single_pane_snapshot(r#""protocol":1,"#), "n1", "mini");
+        let terminal = only_terminal(&rows);
+        assert_eq!(terminal.foreign_remote_protocol, Some(1));
+
+        let status = crate::federation::live_view_status(terminal.foreign_remote_protocol);
+        assert_eq!(
+            status,
+            crate::federation::LiveViewStatus::VersionMismatch {
+                remote: 1,
+                local: crate::protocol::PROTOCOL_VERSION,
+            }
+        );
+        let message = status.message();
+        assert!(message.contains("protocol mismatch"), "{message}");
+    }
 }
