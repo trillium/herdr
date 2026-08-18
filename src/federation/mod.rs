@@ -20,7 +20,12 @@
 //! fetches each remote origin's snapshot on a ~5s timer when the flag is enabled
 //! at startup and projects it live into the sidebar. Phase **N1d** adds input
 //! relay ([`relay::send_input_to_foreign_pane`]) so typing into a foreign pane
-//! sends keystrokes to its remote PTY. The module-level allows below remain only
+//! sends keystrokes to its remote PTY. Phase **N2** classifies whether an
+//! origin's protocol permits a live view ([`live_view::live_view_status`]), and
+//! phase **N3** acts on that verdict with [`observe::spawn_observe_manager`]:
+//! one `ObserveTerminal` connection per attachable foreign pane, streaming the
+//! remote's semantic frames back for the hub to draw in place of the status
+//! placeholder. The module-level allows below remain only
 //! for the still-unwired N0 surface (registry); they shrink as later phases
 //! consume it.
 #![allow(dead_code, unused_imports)]
@@ -30,6 +35,7 @@ mod ingest;
 mod label;
 mod live_view;
 mod namespace;
+mod observe;
 mod origin;
 mod poll;
 mod registry;
@@ -46,6 +52,7 @@ pub use namespace::{
     is_foreign, is_foreign_workspace_id, namespace_public_id, namespace_terminal_id,
     parse_foreign_terminal_id, parse_foreign_workspace_id,
 };
+pub use observe::{spawn_observe_manager, ObserveSpec, DEFAULT_OBSERVE_COLS, DEFAULT_OBSERVE_ROWS};
 pub use origin::{ConnectionTarget, InvalidOriginKey, Origin, OriginKey};
 pub use poll::collect_foreign_rows;
 pub use registry::{FederationRegistry, ReconcileDelta};

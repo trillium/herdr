@@ -51,6 +51,16 @@ const FEDERATION_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
 /// each message replaces the whole foreign projection, so only the latest tick
 /// matters and backpressure on a slow run loop is harmless.
 const FOREIGN_ROWS_CHANNEL_CAP: usize = 4;
+/// Bounded capacity for the run loop -> observe manager desired-specs channel
+/// (N3). Small for the same reason as [`FOREIGN_ROWS_CHANNEL_CAP`]: each message
+/// is a full replacement of the desired live-view set, so only the latest one
+/// matters.
+const FOREIGN_OBSERVE_SPECS_CHANNEL_CAP: usize = 4;
+/// Bounded capacity for the observe workers -> run loop frame channel (N3).
+/// Deeper than the control channels because it carries per-pane screen updates
+/// from several origins at once, but still bounded: when the run loop falls
+/// behind, workers block rather than buffering unbounded remote output.
+const FOREIGN_FRAME_CHANNEL_CAP: usize = 32;
 const PENDING_AGENT_RESUME_THEME_WAIT: Duration = Duration::from_millis(750);
 const SESSION_SAVE_DEBOUNCE: Duration = Duration::from_secs(5);
 const SIDEBAR_DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(350);
@@ -182,6 +192,19 @@ pub struct App {
     /// `experimental.federation` was enabled at startup. `None` means no polling
     /// and therefore no federation network I/O.
     pub(crate) federation_poll: Option<FederationPollHandle>,
+    /// Sender kept alive for the app's lifetime for the same reason as
+    /// [`App::foreign_rows_tx`]: the run loop's `recv()` pends instead of
+    /// spinning on `None` when no observe manager is running.
+    pub(crate) foreign_frame_tx:
+        mpsc::Sender<(crate::terminal::TerminalId, crate::protocol::FrameData)>,
+    /// Receiver drained by the run loop; each message is one foreign pane's
+    /// latest live-view frame (N3).
+    pub(crate) foreign_frame_rx:
+        mpsc::Receiver<(crate::terminal::TerminalId, crate::protocol::FrameData)>,
+    /// Handle to the running federation live-view manager (N3), present under
+    /// the same conditions as [`App::federation_poll`]. `None` means no observe
+    /// connections and therefore no live-view network I/O.
+    pub(crate) federation_observe: Option<FederationObserveHandle>,
     /// Resolved `federation_socket_dir` from the config, passed to
     /// [`crate::federation::discover_origins`] at each discovery call.
     pub(crate) federation_socket_dir: Option<std::path::PathBuf>,
@@ -205,6 +228,30 @@ impl FederationPollHandle {
     }
 }
 
+/// Lifecycle handle for the background federation live-view manager (N3).
+pub(crate) struct FederationObserveHandle {
+    /// Signals the manager (and, through it, every per-pane connection) to stop.
+    shutdown: Arc<Notify>,
+    /// Publishes the full desired observe set whenever the projection changes.
+    specs_tx: mpsc::Sender<Vec<crate::federation::ObserveSpec>>,
+    /// The spawned manager task; aborted as a backstop when the handle is torn
+    /// down. Aborting is safe for the workers it owns: dropping the manager drops
+    /// its worker map, and each worker sets its stop flag on drop.
+    task: tokio::task::JoinHandle<()>,
+    /// The last set published to the manager, so an unchanged projection sends
+    /// nothing and existing connections are never needlessly recycled.
+    published: Vec<crate::federation::ObserveSpec>,
+}
+
+impl FederationObserveHandle {
+    /// Stop the manager and every live-view connection it owns, so a disabled
+    /// runtime performs no further federation network I/O.
+    fn stop(self) {
+        self.shutdown.notify_one();
+        self.task.abort();
+    }
+}
+
 pub(crate) const APP_EVENT_CHANNEL_CAPACITY: usize = 256;
 pub(crate) const APP_EVENT_DRAIN_LIMIT: usize = 64;
 
@@ -218,6 +265,9 @@ pub(crate) enum LoopEvent {
     /// A federation poll tick delivered a full replacement of the projected
     /// foreign rows (N1c).
     ForeignRows(crate::federation::ForeignRows),
+    /// A federation live-view connection delivered a foreign pane's latest
+    /// frame (N3).
+    ForeignFrame(crate::terminal::TerminalId, crate::protocol::FrameData),
 }
 
 struct SyncOutputGuard;
@@ -431,6 +481,10 @@ impl App {
         let (event_tx, event_rx) = mpsc::channel::<AppEvent>(APP_EVENT_CHANNEL_CAPACITY);
         let (foreign_rows_tx, foreign_rows_rx) =
             mpsc::channel::<crate::federation::ForeignRows>(FOREIGN_ROWS_CHANNEL_CAP);
+        let (foreign_frame_tx, foreign_frame_rx) = mpsc::channel::<(
+            crate::terminal::TerminalId,
+            crate::protocol::FrameData,
+        )>(FOREIGN_FRAME_CHANNEL_CAP);
         let render_notify = Arc::new(Notify::new());
         let render_dirty = Arc::new(crate::render_signal::RenderSignal::new());
 
@@ -847,6 +901,9 @@ impl App {
             foreign_rows_tx,
             foreign_rows_rx,
             federation_poll: None,
+            foreign_frame_tx,
+            foreign_frame_rx,
+            federation_observe: None,
             federation_socket_dir: config
                 .experimental
                 .federation_socket_dir
@@ -1059,6 +1116,74 @@ impl App {
         }
     }
 
+    /// Spawn the federation live-view manager (N3), if not already running.
+    ///
+    /// Runs alongside the snapshot poll and under the same conditions: the poll
+    /// decides *which* foreign panes exist, the manager decides which of them get
+    /// a streamed screen. Spawning it opens no connections by itself — the first
+    /// desired-spec publication does.
+    fn spawn_federation_observe(&mut self) {
+        if self.federation_observe.is_some() {
+            return;
+        }
+        let shutdown = Arc::new(Notify::new());
+        let (specs_tx, specs_rx) =
+            mpsc::channel::<Vec<crate::federation::ObserveSpec>>(FOREIGN_OBSERVE_SPECS_CHANNEL_CAP);
+        let task = crate::federation::spawn_observe_manager(
+            specs_rx,
+            self.foreign_frame_tx.clone(),
+            shutdown.clone(),
+            self.federation_socket_dir.clone(),
+        );
+        self.federation_observe = Some(FederationObserveHandle {
+            shutdown,
+            specs_tx,
+            task,
+            published: Vec::new(),
+        });
+    }
+
+    /// Stop the federation live-view manager if one is running, closing every
+    /// per-pane connection with it.
+    fn stop_federation_observe(&mut self) {
+        if let Some(handle) = self.federation_observe.take() {
+            handle.stop();
+        }
+    }
+
+    /// Publish the currently desired live-view set to the observe manager (N3).
+    ///
+    /// Called after a render, because the desired set is derived from the pane
+    /// rects computed there. Returns immediately when no manager is running
+    /// (federation off), so a non-federated session pays nothing; when one is
+    /// running, an unchanged set sends nothing and leaves existing connections
+    /// untouched.
+    pub(crate) fn sync_federation_observe(&mut self) {
+        if self.federation_observe.is_none() {
+            return;
+        }
+        let specs = self.state.foreign_observe_specs();
+        let Some(handle) = self.federation_observe.as_mut() else {
+            return;
+        };
+        if handle.published == specs {
+            return;
+        }
+        match handle.specs_tx.try_send(specs.clone()) {
+            Ok(()) => handle.published = specs,
+            // Leave `published` stale so the next render retries; the manager is
+            // only behind by at most a few full replacements.
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                tracing::debug!(
+                    "federation observe: manager busy; retrying desired set next render"
+                )
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                tracing::warn!("federation observe: manager stopped; live views will not update")
+            }
+        }
+    }
+
     /// Start the federation snapshot poll iff `experimental.federation` was
     /// enabled at startup. Idempotent (no-op if already running or disabled).
     /// Called by both the direct-TUI run loop (`App::run`) and the headless
@@ -1067,6 +1192,7 @@ impl App {
     pub(crate) fn start_federation_poll_if_enabled(&mut self) {
         if self.state.federation_enabled {
             self.spawn_federation_poll();
+            self.spawn_federation_observe();
         }
     }
 
@@ -1278,6 +1404,9 @@ impl App {
                     self.render_dirty.request_generic();
                     self.render_notify.notify_one();
                 }
+                // Pane rects are fresh now, so this is where the desired
+                // live-view set is republished (no-op unless federation is on).
+                self.sync_federation_observe();
                 self.last_render_at = Some(now);
                 needs_render = false;
                 continue;
@@ -1304,6 +1433,12 @@ impl App {
                         // never fully closes: `None` cannot occur and, with no
                         // poll task, this branch simply pends.
                         Some(rows) => LoopEvent::ForeignRows(rows),
+                        None => LoopEvent::Timer,
+                    },
+                    maybe_frame = self.foreign_frame_rx.recv() => match maybe_frame {
+                        // Same as above: `self` holds a live `foreign_frame_tx`,
+                        // so this branch pends when no live view is streaming.
+                        Some((terminal_id, frame)) => LoopEvent::ForeignFrame(terminal_id, frame),
                         None => LoopEvent::Timer,
                     },
                     _ = sleep_until_or_pending(next_deadline) => LoopEvent::Timer,
@@ -1341,6 +1476,10 @@ impl App {
                     // federation is enabled and clears it (ignoring `rows`) when
                     // it is not, so a tick that races a disable is a safe no-op.
                     self.state.apply_foreign_rows(rows);
+                    needs_render = true;
+                }
+                LoopEvent::ForeignFrame(terminal_id, frame) => {
+                    self.state.apply_foreign_frame(&terminal_id, frame);
                     needs_render = true;
                 }
             }
@@ -1705,6 +1844,9 @@ impl App {
                 // foreign rows so a disabled build never keeps remote state,
                 // mirroring the kitty-graphics teardown above.
                 self.stop_federation_poll();
+                // Live views hold open sockets to remote origins, so they must go
+                // down with the poll, not merely stop being drawn.
+                self.stop_federation_observe();
                 self.state
                     .set_foreign_rows(crate::federation::ForeignRows::empty());
             }
@@ -3174,19 +3316,158 @@ mod tests {
             enabled.federation_poll.is_some(),
             "enabled flag spawns the poll task"
         );
+        assert!(
+            enabled.federation_observe.is_some(),
+            "enabled flag spawns the live-view manager alongside the poll (N3)"
+        );
         // Idempotent: a second call must not replace the running task.
         enabled.start_federation_poll_if_enabled();
         assert!(
             enabled.federation_poll.is_some(),
             "start seam is idempotent while running"
         );
+        assert!(
+            enabled.federation_observe.is_some(),
+            "start seam is idempotent for the live-view manager too"
+        );
         enabled.stop_federation_poll();
+        enabled.stop_federation_observe();
 
         let mut disabled = build_app(false);
         disabled.start_federation_poll_if_enabled();
         assert!(
             disabled.federation_poll.is_none(),
             "disabled flag spawns no poll task"
+        );
+        assert!(
+            disabled.federation_observe.is_none(),
+            "disabled flag opens no live-view connections"
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_disable_stops_the_live_view_manager() {
+        // Live views hold open sockets to remote origins, so a runtime disable
+        // must take them down with the poll, not merely stop drawing them.
+        let mut config = Config::default();
+        config.experimental.federation = true;
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(&config, true, None, api_rx, crate::api::EventHub::default());
+        app.start_federation_poll_if_enabled();
+        assert!(app.federation_observe.is_some());
+
+        app.apply_live_config(&Config::default(), &[], &[], false);
+
+        assert!(
+            app.federation_observe.is_none(),
+            "disabling federation stops the live-view manager"
+        );
+        assert!(app.federation_poll.is_none(), "and the snapshot poll");
+    }
+
+    #[tokio::test]
+    async fn observe_sync_publishes_the_desired_set_only_when_it_changes() {
+        // The desired set is republished after every render, so an unchanged
+        // projection must send nothing — otherwise working connections would be
+        // recycled on each frame.
+        let mut config = Config::default();
+        config.experimental.federation = true;
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(&config, true, None, api_rx, crate::api::EventHub::default());
+
+        // No manager running: sync is a no-op, not a panic.
+        app.sync_federation_observe();
+        assert!(app.federation_observe.is_none());
+
+        app.start_federation_poll_if_enabled();
+        // An empty projection is still a change from the initial "never published"
+        // state, so exactly one message goes out and the next sync sends nothing.
+        app.sync_federation_observe();
+        let published = app
+            .federation_observe
+            .as_ref()
+            .map(|handle| handle.published.clone())
+            .expect("manager running");
+        assert!(published.is_empty(), "no foreign panes are laid out");
+
+        app.sync_federation_observe();
+        assert_eq!(
+            app.federation_observe
+                .as_ref()
+                .map(|handle| handle.published.len()),
+            Some(0),
+            "an unchanged desired set leaves the published set alone"
+        );
+
+        app.stop_federation_poll();
+        app.stop_federation_observe();
+    }
+
+    #[test]
+    fn frame_channel_applies_live_view_frames_as_the_run_loop_does() {
+        // Exercises the N3 frame delivery path without a real socket: a frame is
+        // delivered on the same channel the observe workers use and drained
+        // exactly as the run loop's select! branch does.
+        let mut config = Config::default();
+        config.experimental.federation = true;
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(&config, true, None, api_rx, crate::api::EventHub::default());
+
+        let body = include_str!("../federation/testdata/sample-session-snapshot.json");
+        let snap = crate::federation::RemoteSnapshot::from_api_response(body)
+            .expect("sample fixture parses");
+        let origin = crate::federation::Origin::new(
+            crate::federation::OriginKey::new("mini1").expect("valid origin key"),
+            "mini1",
+            crate::federation::ConnectionTarget::LocalSocket(std::path::PathBuf::from(
+                "/tmp/fed-frame-channel-test.sock",
+            )),
+        );
+        app.state
+            .apply_foreign_rows(crate::federation::foreign_rows(&origin, &snap));
+
+        let terminal_id = app
+            .state
+            .terminals
+            .keys()
+            .filter(|id| crate::federation::parse_foreign_terminal_id(id).is_some())
+            .min_by_key(|id| id.as_str().to_string())
+            .cloned()
+            .expect("fixture projects foreign terminals");
+
+        let frame = crate::protocol::FrameData {
+            cells: vec![
+                crate::protocol::CellData {
+                    symbol: "z".to_string(),
+                    fg: 0,
+                    bg: 0,
+                    modifier: 0,
+                    skip: false,
+                    hyperlink: None,
+                };
+                4
+            ],
+            width: 2,
+            height: 2,
+            cursor: None,
+            hyperlinks: Vec::new(),
+            graphics: Vec::new(),
+        };
+        app.foreign_frame_tx
+            .try_send((terminal_id.clone(), frame))
+            .expect("frame channel has capacity");
+        let (delivered_id, delivered_frame) =
+            app.foreign_frame_rx.try_recv().expect("a frame is queued");
+        app.state
+            .apply_foreign_frame(&delivered_id, delivered_frame);
+
+        assert_eq!(
+            app.state.terminals[&terminal_id]
+                .foreign_frame
+                .as_deref()
+                .map(|frame| (frame.width, frame.height)),
+            Some((2, 2)),
+            "the channel-delivered frame reaches its foreign terminal"
         );
     }
 

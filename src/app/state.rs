@@ -1544,6 +1544,18 @@ impl AppState {
             .map(|ws| ws.id.clone());
         let focused_selected_id = self.workspaces.get(self.selected).map(|ws| ws.id.clone());
 
+        // Carry live-view frames (N3) across the replace. Snapshot rows are
+        // rebuilt from scratch every poll tick and cannot carry a frame, so
+        // without this a pane streaming a live view would drop back to the
+        // status placeholder on every tick. Keyed by namespaced terminal id, so
+        // a terminal that disappeared from the remote simply drops its frame.
+        let retained_frames: Vec<(crate::terminal::TerminalId, _)> = self
+            .terminals
+            .iter_mut()
+            .filter(|(id, _)| crate::federation::parse_foreign_terminal_id(id).is_some())
+            .filter_map(|(id, terminal)| Some((id.clone(), terminal.foreign_frame.take()?)))
+            .collect();
+
         // Strip previously-injected foreign rows, keyed on the origin-namespace
         // predicate (never a raw string check) so repeated calls replace rather
         // than accumulate.
@@ -1564,6 +1576,12 @@ impl AppState {
         // re-keying.
         for (terminal_id, terminal) in rows.terminals {
             self.terminals.insert(terminal_id, terminal);
+        }
+        // Restore live-view frames onto the terminals that survived the replace.
+        for (terminal_id, frame) in retained_frames {
+            if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
+                terminal.foreign_frame = Some(frame);
+            }
         }
         // Append after local workspaces; never insert before them, so any
         // `active`/`selected` index into local workspaces is preserved.
@@ -1661,6 +1679,86 @@ impl AppState {
             crate::federation::ForeignRows::empty()
         };
         self.set_foreign_rows(rows);
+    }
+
+    /// Store a live-view frame (N3) streamed from a foreign origin.
+    ///
+    /// Addressed by namespaced terminal id. A frame for a terminal that is no
+    /// longer projected is dropped: the observe worker and the snapshot poll run
+    /// independently, so a frame can arrive just after the pane disappeared.
+    /// That race is expected, not an error, so it logs at debug.
+    pub fn apply_foreign_frame(
+        &mut self,
+        terminal_id: &crate::terminal::TerminalId,
+        frame: crate::protocol::FrameData,
+    ) {
+        let Some(terminal) = self.terminals.get_mut(terminal_id) else {
+            tracing::debug!(
+                terminal = %terminal_id.as_str(),
+                "federation: dropped live-view frame for an unknown terminal"
+            );
+            return;
+        };
+        terminal.set_foreign_frame(frame);
+    }
+
+    /// The set of foreign panes that should currently hold a live-view
+    /// connection (N3), in a deterministic order.
+    ///
+    /// Scoped to the panes laid out for the active workspace: only those are
+    /// drawn, and an observe connection makes the *remote* render that pane
+    /// continuously, so opening one for an off-screen pane would spend a remote's
+    /// budget on cells nobody sees. Requesting geometry from the already-computed
+    /// pane rects adds no work to the render path — the caller pulls this on
+    /// projection changes, not per frame.
+    ///
+    /// Returns empty when federation is disabled or the active workspace is
+    /// local.
+    pub fn foreign_observe_specs(&self) -> Vec<crate::federation::ObserveSpec> {
+        if !self.federation_enabled {
+            return Vec::new();
+        }
+        let Some(workspace) = self.active.and_then(|idx| self.workspaces.get(idx)) else {
+            return Vec::new();
+        };
+        if !crate::federation::is_foreign_workspace_id(&workspace.id) {
+            return Vec::new();
+        }
+
+        let mut specs = Vec::new();
+        for info in &self.view.pane_infos {
+            let Some(terminal_id) = workspace.terminal_id(info.id) else {
+                continue;
+            };
+            let Some((origin, remote_terminal_id)) =
+                crate::federation::parse_foreign_terminal_id(terminal_id)
+            else {
+                continue;
+            };
+            let Some(terminal) = self.terminals.get(terminal_id) else {
+                continue;
+            };
+            // Only origins whose protocol matches this hub can serve a live view;
+            // the rest keep the N2 status placeholder.
+            if crate::federation::live_view_status(terminal.foreign_remote_protocol)
+                != crate::federation::LiveViewStatus::Attachable
+            {
+                continue;
+            }
+            // A zero-sized rect would ask the origin to render nothing; skip until
+            // the pane has real geometry.
+            if info.inner_rect.width == 0 || info.inner_rect.height == 0 {
+                continue;
+            }
+            specs.push(crate::federation::ObserveSpec {
+                terminal_id: terminal_id.clone(),
+                origin,
+                target: remote_terminal_id.as_str().to_string(),
+                cols: info.inner_rect.width,
+                rows: info.inner_rect.height,
+            });
+        }
+        specs
     }
 
     pub(crate) fn remove_alias_shadowed_by_new_pane(&mut self, pane_id: PaneId) {
@@ -2718,6 +2816,213 @@ mod tests {
             "local workspaces restored when the flag is disabled"
         );
         state.assert_invariants_for_test();
+    }
+
+    // --- Federation live view (N3) --------------------------------------------
+
+    fn sample_frame(width: u16, height: u16, fill: &str) -> crate::protocol::FrameData {
+        crate::protocol::FrameData {
+            cells: vec![
+                crate::protocol::CellData {
+                    symbol: fill.to_string(),
+                    fg: 0,
+                    bg: 0,
+                    modifier: 0,
+                    skip: false,
+                    hyperlink: None,
+                };
+                (width as usize) * (height as usize)
+            ],
+            width,
+            height,
+            cursor: None,
+            hyperlinks: Vec::new(),
+            graphics: Vec::new(),
+        }
+    }
+
+    fn first_foreign_terminal_id(state: &AppState) -> crate::terminal::TerminalId {
+        state
+            .terminals
+            .keys()
+            .filter(|id| crate::federation::parse_foreign_terminal_id(id).is_some())
+            .min_by_key(|id| id.as_str().to_string())
+            .cloned()
+            .expect("fixture projects at least one foreign terminal")
+    }
+
+    #[test]
+    fn apply_foreign_frame_stores_the_frame_on_its_terminal() {
+        let mut state = AppState::test_with_adversarial_identity_state();
+        state.set_foreign_rows(sample_foreign_rows("n1", "mini"));
+        let terminal_id = first_foreign_terminal_id(&state);
+
+        state.apply_foreign_frame(&terminal_id, sample_frame(4, 2, "a"));
+
+        let stored = state.terminals[&terminal_id]
+            .foreign_frame
+            .as_deref()
+            .expect("frame stored on the addressed terminal");
+        assert_eq!((stored.width, stored.height), (4, 2));
+
+        // A later frame replaces the previous one outright (full screens, not diffs).
+        state.apply_foreign_frame(&terminal_id, sample_frame(6, 3, "b"));
+        let stored = state.terminals[&terminal_id]
+            .foreign_frame
+            .as_deref()
+            .expect("frame still stored");
+        assert_eq!((stored.width, stored.height), (6, 3));
+    }
+
+    #[test]
+    fn apply_foreign_frame_drops_frames_for_unknown_terminals() {
+        // The observe workers and the snapshot poll run independently, so a frame
+        // can arrive just after its pane disappeared. That must be a no-op.
+        let mut state = AppState::test_with_adversarial_identity_state();
+        let unknown = crate::terminal::TerminalId::from_string("fed~n1~gone".to_string());
+
+        state.apply_foreign_frame(&unknown, sample_frame(2, 1, "x"));
+
+        assert!(!state.terminals.contains_key(&unknown));
+    }
+
+    #[test]
+    fn foreign_splice_carries_live_view_frames_across_poll_ticks() {
+        // Snapshot rows are rebuilt from scratch every tick and carry no frame, so
+        // without the carry-over a streaming pane would flicker back to the status
+        // placeholder every poll interval.
+        let mut state = AppState::test_with_adversarial_identity_state();
+        state.set_foreign_rows(sample_foreign_rows("n1", "mini"));
+        let terminal_id = first_foreign_terminal_id(&state);
+        state.apply_foreign_frame(&terminal_id, sample_frame(4, 2, "a"));
+
+        state.set_foreign_rows(sample_foreign_rows("n1", "mini"));
+
+        assert!(
+            state.terminals[&terminal_id].foreign_frame.is_some(),
+            "a surviving foreign terminal keeps its live-view frame across a replace"
+        );
+
+        // A terminal that disappears from the remote drops its frame with it.
+        state.set_foreign_rows(empty_foreign_rows());
+        assert!(!state.terminals.contains_key(&terminal_id));
+    }
+
+    /// Project the fixture's foreign rows, focus the foreign workspace, mark its
+    /// origin protocol-compatible, and lay out its panes — the state in which a
+    /// live view is expected.
+    fn state_with_attachable_foreign_panes() -> AppState {
+        let mut state = AppState::test_with_adversarial_identity_state();
+        state.federation_enabled = true;
+        state.apply_foreign_rows(sample_foreign_rows("n1", "mini"));
+
+        let ws_idx = state
+            .workspaces
+            .iter()
+            .position(is_foreign_workspace)
+            .expect("fixture projects a foreign workspace");
+        state.active = Some(ws_idx);
+
+        for (_, terminal) in state.terminals.iter_mut() {
+            terminal.foreign_remote_protocol = Some(crate::protocol::PROTOCOL_VERSION);
+        }
+
+        let workspace = &state.workspaces[ws_idx];
+        state.view.pane_infos = workspace.tabs[workspace.active_tab]
+            .panes
+            .keys()
+            .map(|pane_id| crate::layout::PaneInfo {
+                id: *pane_id,
+                rect: Rect::new(0, 0, 82, 26),
+                inner_rect: Rect::new(1, 1, 80, 24),
+                scrollbar_rect: None,
+                borders: ratatui::widgets::Borders::ALL,
+                is_focused: false,
+            })
+            .collect();
+        state
+    }
+
+    #[test]
+    fn foreign_observe_specs_target_attachable_visible_panes() {
+        let state = state_with_attachable_foreign_panes();
+
+        let specs = state.foreign_observe_specs();
+
+        assert!(
+            !specs.is_empty(),
+            "an attachable, laid-out foreign pane must be observed"
+        );
+        for spec in &specs {
+            let (origin, remote) = crate::federation::parse_foreign_terminal_id(&spec.terminal_id)
+                .expect("spec addresses a namespaced foreign terminal");
+            assert_eq!(spec.origin, origin, "spec carries its terminal's origin");
+            assert_eq!(
+                spec.target,
+                remote.as_str(),
+                "the observe target is the remote's own terminal id, not the namespaced one"
+            );
+            assert_eq!(
+                (spec.cols, spec.rows),
+                (80, 24),
+                "geometry comes from the pane's inner rect"
+            );
+        }
+    }
+
+    #[test]
+    fn foreign_observe_specs_skip_non_attachable_origins() {
+        let mut state = state_with_attachable_foreign_panes();
+        assert!(!state.foreign_observe_specs().is_empty());
+
+        // Protocol mismatch: the pane keeps the N2 status placeholder and must not
+        // hold a connection open.
+        for (_, terminal) in state.terminals.iter_mut() {
+            terminal.foreign_remote_protocol = Some(crate::protocol::PROTOCOL_VERSION + 1);
+        }
+        assert!(state.foreign_observe_specs().is_empty());
+
+        // Unknown protocol is likewise not attachable.
+        for (_, terminal) in state.terminals.iter_mut() {
+            terminal.foreign_remote_protocol = None;
+        }
+        assert!(state.foreign_observe_specs().is_empty());
+    }
+
+    #[test]
+    fn foreign_observe_specs_empty_without_a_focused_foreign_workspace() {
+        let mut state = state_with_attachable_foreign_panes();
+
+        // Federation disabled: no live-view network I/O at all.
+        state.federation_enabled = false;
+        assert!(state.foreign_observe_specs().is_empty());
+        state.federation_enabled = true;
+
+        // A local workspace in focus: foreign panes are not on screen.
+        let local_idx = state
+            .workspaces
+            .iter()
+            .position(|ws| !is_foreign_workspace(ws))
+            .expect("fixture keeps local workspaces");
+        state.active = Some(local_idx);
+        assert!(state.foreign_observe_specs().is_empty());
+
+        // No workspace focused at all.
+        state.active = None;
+        assert!(state.foreign_observe_specs().is_empty());
+    }
+
+    #[test]
+    fn foreign_observe_specs_skip_zero_sized_panes() {
+        let mut state = state_with_attachable_foreign_panes();
+        for info in state.view.pane_infos.iter_mut() {
+            info.inner_rect = Rect::new(1, 1, 0, 0);
+        }
+
+        assert!(
+            state.foreign_observe_specs().is_empty(),
+            "a zero-sized rect would ask the origin to render nothing"
+        );
     }
 
     fn navigator_row_for_display(is_workspace: bool) -> NavigatorRow {
