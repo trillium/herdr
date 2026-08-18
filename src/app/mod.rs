@@ -6551,6 +6551,10 @@ last_pane = "prefix+tab"
 
     #[test]
     fn route_client_input_advances_onboarding_modal() {
+        // Completing onboarding calls update_config_file, which writes to the
+        // process-global config path. Hold the config env lock so this cannot
+        // clobber the config file of a test that owns CONFIG_PATH_ENV_VAR.
+        let _lock = config_env_lock().lock().unwrap();
         let mut app = test_app();
         app.state.mode = Mode::Onboarding;
 
