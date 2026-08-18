@@ -128,6 +128,7 @@ enum LoopEvent {
     ServerEvent(ServerEvent),
     RenderRequested,
     ForeignRows(crate::federation::ForeignRows),
+    ForeignFrame(crate::terminal::TerminalId, crate::protocol::FrameData),
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
@@ -780,6 +781,9 @@ impl HeadlessServer {
                     crate::render_prof::event("full_render.invoke");
                     self.render_and_stream();
                 }
+                // Pane rects are fresh now, so this is where the desired
+                // live-view set is republished (no-op unless federation is on).
+                self.app.sync_federation_observe();
                 self.app.last_render_at = Some(now);
                 needs_render = false;
                 needs_full_render = false;
@@ -823,6 +827,12 @@ impl HeadlessServer {
                         // never fully closes: `None` cannot occur and, with no
                         // poll task, this branch simply pends.
                         Some(rows) => LoopEvent::ForeignRows(rows),
+                        None => LoopEvent::Timer,
+                    },
+                    maybe_frame = self.app.foreign_frame_rx.recv() => match maybe_frame {
+                        // Same as above: the app holds a live `foreign_frame_tx`,
+                        // so this branch pends when no live view is streaming.
+                        Some((terminal_id, frame)) => LoopEvent::ForeignFrame(terminal_id, frame),
                         None => LoopEvent::Timer,
                     },
                     _ = sleep_until_or_pending(next_deadline) => LoopEvent::Timer,
@@ -911,6 +921,14 @@ impl HeadlessServer {
                     // `rows`) when it is not, so a tick that races a disable is a
                     // safe no-op.
                     self.app.state.apply_foreign_rows(rows);
+                    needs_render = true;
+                    needs_full_render = true;
+                }
+                LoopEvent::ForeignFrame(terminal_id, frame) => {
+                    // A live-view frame replaces the whole foreign pane's cells,
+                    // and the retained-render paths only know about local PTY
+                    // sources, so this needs the full render path.
+                    self.app.state.apply_foreign_frame(&terminal_id, frame);
                     needs_render = true;
                     needs_full_render = true;
                 }
@@ -10511,6 +10529,62 @@ next_tab = ""
                 .iter()
                 .any(|ws| crate::federation::is_foreign_workspace_id(&ws.id)),
             "headless runtime projects channel-delivered foreign rows into state"
+        );
+
+        // Same guard for the N3 live-view frame path: the frame channel drain and
+        // its `LoopEvent::ForeignFrame` arm must exist on the production runtime
+        // too, or streamed frames would only ever reach the direct-TUI path and
+        // the observe workers would block on a channel nobody drains.
+        let terminal_id = server
+            .app
+            .state
+            .terminals
+            .keys()
+            .filter(|id| crate::federation::parse_foreign_terminal_id(id).is_some())
+            .min_by_key(|id| id.as_str().to_string())
+            .cloned()
+            .expect("fixture projects foreign terminals");
+        let frame = crate::protocol::FrameData {
+            cells: vec![
+                crate::protocol::CellData {
+                    symbol: "z".to_string(),
+                    fg: 0,
+                    bg: 0,
+                    modifier: 0,
+                    skip: false,
+                    hyperlink: None,
+                };
+                4
+            ],
+            width: 2,
+            height: 2,
+            cursor: None,
+            hyperlinks: Vec::new(),
+            graphics: Vec::new(),
+        };
+
+        server
+            .app
+            .foreign_frame_tx
+            .try_send((terminal_id.clone(), frame))
+            .expect("frame channel has capacity");
+        let (delivered_id, delivered_frame) = server
+            .app
+            .foreign_frame_rx
+            .try_recv()
+            .expect("a live-view frame is queued");
+        server
+            .app
+            .state
+            .apply_foreign_frame(&delivered_id, delivered_frame);
+
+        assert_eq!(
+            server.app.state.terminals[&terminal_id]
+                .foreign_frame
+                .as_deref()
+                .map(|frame| (frame.width, frame.height)),
+            Some((2, 2)),
+            "headless runtime applies channel-delivered live-view frames"
         );
     }
 

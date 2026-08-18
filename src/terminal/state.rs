@@ -153,6 +153,15 @@ pub struct TerminalState {
     /// view compatibility status. `None` for local terminals and when the
     /// origin did not report a protocol.
     pub foreign_remote_protocol: Option<u32>,
+    /// For a federated (foreign) terminal, the most recent frame streamed from
+    /// the owning origin's `ObserveTerminal` connection (N3 live view). `None`
+    /// for local terminals, for foreign terminals whose origin's protocol does
+    /// not match, and before the first frame arrives — in which case the pane
+    /// renders the live-view status placeholder instead.
+    ///
+    /// Shared behind an `Arc` because the render path only reads it and the
+    /// federation splice carries it across poll ticks without a deep copy.
+    pub foreign_frame: Option<std::sync::Arc<crate::protocol::FrameData>>,
     recent_agent_process_exit: Option<RecentAgentProcessExit>,
     agent_process_acquisition_pending: bool,
     pub pending_agent_resume_plan: Option<crate::agent_resume::AgentResumePlan>,
@@ -189,6 +198,7 @@ impl TerminalState {
             respawn_shell_on_exit: false,
             foreign_remote_pane_id: None,
             foreign_remote_protocol: None,
+            foreign_frame: None,
             recent_agent_process_exit: None,
             agent_process_acquisition_pending: false,
             pending_agent_resume_plan: None,
@@ -247,6 +257,16 @@ impl TerminalState {
             raw_changed: true,
             stripped_changed,
         }
+    }
+
+    /// Store the latest live-view frame streamed from a foreign origin (N3).
+    ///
+    /// Replaces any previous frame outright: the federation observe wire
+    /// negotiates `RenderEncoding::SemanticFrame`, so every frame is a complete
+    /// screen rather than a diff and a dropped intermediate frame is corrected
+    /// by the next one. Local terminals never call this.
+    pub fn set_foreign_frame(&mut self, frame: crate::protocol::FrameData) {
+        self.foreign_frame = Some(std::sync::Arc::new(frame));
     }
 
     pub fn with_launch_argv(mut self, argv: Vec<String>) -> Self {

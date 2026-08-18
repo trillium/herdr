@@ -419,9 +419,10 @@ pub(super) fn render_panes(
     render_pane_borders(app, ws, pane_infos, split_borders, frame);
 }
 
-/// Render the N2 live-view status for a foreign pane (no local runtime): the
-/// origin label plus the protocol-compatibility status, so a protocol mismatch
-/// is a visible, non-crash state rather than a silently blank pane.
+/// Render a foreign pane (no local runtime): the streamed live view when one is
+/// available (N3), otherwise the live-view status placeholder (N2) — the origin
+/// label plus the protocol-compatibility status, so a protocol mismatch is a
+/// visible, non-crash state rather than a silently blank pane.
 fn render_foreign_live_view_placeholder(
     app: &AppState,
     ws: &crate::workspace::Workspace,
@@ -435,11 +436,22 @@ fn render_foreign_live_view_placeholder(
         return;
     }
 
-    let status = app
-        .terminals
-        .get(terminal_id)
+    let terminal = app.terminals.get(terminal_id);
+    let status = terminal
         .map(|terminal| crate::federation::live_view_status(terminal.foreign_remote_protocol))
         .unwrap_or(crate::federation::LiveViewStatus::UnknownRemoteProtocol);
+
+    // An attachable origin streams real cells; draw those instead of the status
+    // text. Falls through to the placeholder when no frame has arrived yet or a
+    // frame failed to decode, so the pane is never left blank.
+    if status == crate::federation::LiveViewStatus::Attachable {
+        if let Some(foreign_frame) = terminal.and_then(|terminal| terminal.foreign_frame.as_deref())
+        {
+            if render_foreign_frame(foreign_frame, info, frame) {
+                return;
+            }
+        }
+    }
 
     let origin = ws
         .custom_name
@@ -454,6 +466,55 @@ fn render_foreign_live_view_placeholder(
         .wrap(ratatui::widgets::Wrap { trim: false });
     frame.render_widget(Clear, info.inner_rect);
     frame.render_widget(paragraph, info.inner_rect);
+}
+
+/// Draw a foreign pane's streamed live-view frame (N3) into its rect.
+///
+/// Returns `false` without drawing when the remote frame is malformed (its cell
+/// count disagrees with its own dimensions), so the caller can fall back to the
+/// status placeholder. A remote can send anything, so a bad frame must degrade,
+/// never panic.
+fn render_foreign_frame(
+    foreign_frame: &crate::protocol::FrameData,
+    info: &PaneInfo,
+    frame: &mut Frame,
+) -> bool {
+    let Some(source) = foreign_frame.to_ratatui_buffer() else {
+        return false;
+    };
+    blit_foreign_frame(frame.buffer_mut(), &source, info.inner_rect);
+    true
+}
+
+/// Copy `source` into `rect` of `dest`, clipped to the overlap of the two.
+///
+/// The remote's geometry is only as fresh as the last observe handshake, so it
+/// can disagree with the local pane in either direction: extra remote rows and
+/// columns are dropped, and any part of `rect` the source does not cover is
+/// reset so stale cells from a previous render never show through.
+fn blit_foreign_frame(
+    dest: &mut ratatui::buffer::Buffer,
+    source: &ratatui::buffer::Buffer,
+    rect: Rect,
+) {
+    let copy_width = rect.width.min(source.area.width);
+    let copy_height = rect.height.min(source.area.height);
+
+    for row in 0..rect.height {
+        for col in 0..rect.width {
+            let Some(dest_cell) = dest.cell_mut((rect.x + col, rect.y + row)) else {
+                // Outside the frame buffer; nothing to draw into.
+                continue;
+            };
+            if col < copy_width && row < copy_height {
+                if let Some(source_cell) = source.cell((source.area.x + col, source.area.y + row)) {
+                    *dest_cell = source_cell.clone();
+                    continue;
+                }
+            }
+            dest_cell.reset();
+        }
+    }
 }
 
 pub(crate) fn popup_pane_rects(app: &AppState, area: Rect) -> Option<(Rect, Rect)> {
@@ -1052,6 +1113,125 @@ mod tests {
     use crate::terminal::TerminalRuntime;
     use crate::terminal::TerminalState;
     use crate::workspace::Workspace;
+
+    // --- Federation live-view blit (N3) ---------------------------------------
+
+    fn filled_buffer(area: Rect, symbol: &'static str) -> ratatui::buffer::Buffer {
+        let mut cell = ratatui::buffer::Cell::new(symbol);
+        cell.fg = Color::Red;
+        ratatui::buffer::Buffer::filled(area, cell)
+    }
+
+    fn symbols_in(buffer: &ratatui::buffer::Buffer, rect: Rect) -> Vec<String> {
+        (0..rect.height)
+            .flat_map(|row| {
+                (0..rect.width).map(move |col| {
+                    buffer
+                        .cell((rect.x + col, rect.y + row))
+                        .map(|cell| cell.symbol().to_string())
+                        .unwrap_or_default()
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn blit_copies_the_remote_frame_into_the_pane_rect() {
+        let dest_area = Rect::new(0, 0, 10, 6);
+        let mut dest = filled_buffer(dest_area, ".");
+        let source = filled_buffer(Rect::new(0, 0, 3, 2), "R");
+        let rect = Rect::new(2, 1, 3, 2);
+
+        blit_foreign_frame(&mut dest, &source, rect);
+
+        assert_eq!(
+            symbols_in(&dest, rect),
+            vec!["R"; 6],
+            "remote cells land in the rect"
+        );
+        assert_eq!(
+            dest.cell((0, 0)).map(|cell| cell.symbol()),
+            Some("."),
+            "cells outside the rect are untouched"
+        );
+        assert_eq!(
+            dest.cell((2, 1)).map(|cell| cell.fg),
+            Some(Color::Red),
+            "style travels with the cell, not just the symbol"
+        );
+    }
+
+    #[test]
+    fn blit_clips_a_remote_frame_larger_than_the_pane() {
+        // The remote's geometry is only as fresh as the last observe handshake.
+        let dest_area = Rect::new(0, 0, 6, 4);
+        let mut dest = filled_buffer(dest_area, ".");
+        let source = filled_buffer(Rect::new(0, 0, 20, 20), "R");
+        let rect = Rect::new(1, 1, 3, 2);
+
+        blit_foreign_frame(&mut dest, &source, rect);
+
+        assert_eq!(symbols_in(&dest, rect), vec!["R"; 6]);
+        assert_eq!(
+            dest.cell((4, 1)).map(|cell| cell.symbol()),
+            Some("."),
+            "nothing is written past the pane rect"
+        );
+    }
+
+    #[test]
+    fn blit_resets_the_area_a_smaller_remote_frame_does_not_cover() {
+        let dest_area = Rect::new(0, 0, 8, 4);
+        let mut dest = filled_buffer(dest_area, "S");
+        let source = filled_buffer(Rect::new(0, 0, 2, 1), "R");
+        let rect = Rect::new(0, 0, 4, 3);
+
+        blit_foreign_frame(&mut dest, &source, rect);
+
+        assert_eq!(
+            symbols_in(&dest, rect),
+            vec!["R", "R", " ", " ", " ", " ", " ", " ", " ", " ", " ", " "],
+            "uncovered cells are reset so stale content cannot show through"
+        );
+        assert_eq!(
+            dest.cell((2, 0)).map(|cell| cell.fg),
+            Some(Color::Reset),
+            "reset clears style as well as the symbol"
+        );
+        assert_eq!(
+            dest.cell((4, 0)).map(|cell| cell.symbol()),
+            Some("S"),
+            "cells outside the rect are still untouched"
+        );
+    }
+
+    #[test]
+    fn blit_ignores_a_rect_outside_the_destination_buffer() {
+        let dest_area = Rect::new(0, 0, 4, 2);
+        let mut dest = filled_buffer(dest_area, ".");
+        let source = filled_buffer(Rect::new(0, 0, 4, 2), "R");
+
+        // Must not panic, and must not corrupt the visible buffer.
+        blit_foreign_frame(&mut dest, &source, Rect::new(50, 50, 4, 2));
+
+        assert_eq!(symbols_in(&dest, dest_area), vec!["."; 8]);
+    }
+
+    #[test]
+    fn malformed_remote_frame_falls_back_to_the_placeholder() {
+        // `to_ratatui_buffer` returns None when the cell count disagrees with the
+        // frame's own dimensions; a remote can send anything, so that must degrade
+        // rather than panic or draw garbage.
+        let malformed = crate::protocol::FrameData {
+            cells: Vec::new(),
+            width: 4,
+            height: 2,
+            cursor: None,
+            hyperlinks: Vec::new(),
+            graphics: Vec::new(),
+        };
+        assert!(malformed.to_ratatui_buffer().is_none());
+    }
 
     fn render_view_pane_borders(app: &AppState, ws: &Workspace, frame: &mut Frame) {
         render_pane_borders(

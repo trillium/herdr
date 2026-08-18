@@ -603,7 +603,10 @@ impl FrameData {
     /// Reconstructs a ratatui `Buffer` from this frame data.
     ///
     /// Returns `None` if the cells vector length doesn't match `width * height`.
-    #[cfg(test)]
+    ///
+    /// Production callers: the federation live view (N3) decodes a foreign
+    /// pane's streamed frame here before blitting it into the local pane rect,
+    /// so a malformed remote frame degrades to `None` rather than panicking.
     pub fn to_ratatui_buffer(&self) -> Option<ratatui::buffer::Buffer> {
         let expected = (self.width as usize) * (self.height as usize);
         if self.cells.len() != expected {
@@ -617,7 +620,12 @@ impl FrameData {
             for col in 0..self.width {
                 let idx = (row as usize) * (self.width as usize) + (col as usize);
                 let cell_data = &self.cells[idx];
-                let cell = buffer.cell_mut((col, row)).expect("cell within bounds");
+                // Unreachable: `area` is exactly `width` x `height`. Handled
+                // rather than asserted because this decodes untrusted remote
+                // input on the federation live-view path.
+                let Some(cell) = buffer.cell_mut((col, row)) else {
+                    continue;
+                };
                 cell.set_symbol(&cell_data.symbol);
                 cell.fg = u32_to_color(cell_data.fg);
                 cell.bg = u32_to_color(cell_data.bg);
@@ -792,7 +800,9 @@ pub(crate) fn color_to_u32(color: ratatui::style::Color) -> u32 {
 }
 
 /// Converts a packed u32 back to a ratatui `Color`.
-#[cfg(test)]
+///
+/// Production caller: [`FrameData::to_ratatui_buffer`], on the federation
+/// live-view path.
 fn u32_to_color(val: u32) -> ratatui::style::Color {
     match val >> 24 {
         0x00 => match val & 0xFF {
@@ -847,7 +857,10 @@ pub(crate) fn modifier_with_underline_style(
 }
 
 /// Converts a u16 back to a ratatui `Modifier`.
-#[cfg(test)]
+///
+/// Production caller: [`FrameData::to_ratatui_buffer`], on the federation
+/// live-view path. Drops the packed underline-style bits, which ratatui's
+/// `Modifier` cannot represent.
 fn u16_to_modifier(val: u16) -> ratatui::style::Modifier {
     ratatui::style::Modifier::from_bits_truncate(val & !UNDERLINE_STYLE_MASK)
 }
@@ -937,6 +950,36 @@ pub fn read_message<R: Read, M: for<'de> Deserialize<'de>>(
     // Read the 4-byte length prefix, reassembling partial reads.
     let mut len_buf = [0u8; LENGTH_PREFIX_BYTES];
     read_exact_or_eof(reader, &mut len_buf)?;
+    read_message_after_length_prefix(reader, len_buf, max_frame_size)
+}
+
+/// Reads one length-prefixed message whose **first** length-prefix byte has
+/// already been consumed from `reader`.
+///
+/// Identical to [`read_message`] once the prefix is complete. This exists for
+/// readers that need a cancellable idle wait without risking a torn frame: a
+/// caller may wait for the first byte under a short receive timeout (so it can
+/// observe a shutdown flag while the peer is silent), then clear the timeout
+/// and hand that byte here so the rest of the frame is read with framing
+/// intact. The federation live-view observer (N3) is the only such caller.
+pub fn read_message_with_prefix_byte<R: Read, M: for<'de> Deserialize<'de>>(
+    reader: &mut R,
+    first_prefix_byte: u8,
+    max_frame_size: usize,
+) -> Result<M, FramingError> {
+    let mut len_buf = [0u8; LENGTH_PREFIX_BYTES];
+    len_buf[0] = first_prefix_byte;
+    read_exact_or_eof(reader, &mut len_buf[1..])?;
+    read_message_after_length_prefix(reader, len_buf, max_frame_size)
+}
+
+/// Shared tail of [`read_message`] and [`read_message_with_prefix_byte`]:
+/// validate the claimed length, read the payload, and decode it.
+fn read_message_after_length_prefix<R: Read, M: for<'de> Deserialize<'de>>(
+    reader: &mut R,
+    len_buf: [u8; LENGTH_PREFIX_BYTES],
+    max_frame_size: usize,
+) -> Result<M, FramingError> {
     let claimed_len = u32::from_le_bytes(len_buf) as usize;
 
     if claimed_len > max_frame_size {
@@ -1843,6 +1886,61 @@ mod tests {
         let mut chunked = ChunkedReader::new(full_buf, 7);
         let decoded: ClientMessage = read_message(&mut chunked, MAX_FRAME_SIZE).unwrap();
         assert_eq!(msg, decoded);
+    }
+
+    #[test]
+    fn framing_resumes_after_a_consumed_prefix_byte() {
+        // The federation live-view observer waits for one byte under a receive
+        // timeout so it can notice a shutdown request, then reads the rest of the
+        // frame with the timeout cleared. Resuming from that consumed byte must
+        // decode exactly what `read_message` would have.
+        let msg = ServerMessage::Frame(FrameData {
+            cells: vec![
+                CellData {
+                    symbol: "x".to_string(),
+                    fg: 0,
+                    bg: 0,
+                    modifier: 0,
+                    skip: false,
+                    hyperlink: None,
+                };
+                6
+            ],
+            width: 3,
+            height: 2,
+            cursor: None,
+            hyperlinks: Vec::new(),
+            graphics: Vec::new(),
+        });
+        let mut buf = Vec::new();
+        write_message(&mut buf, &msg).unwrap();
+
+        let (first, rest) = buf.split_first().expect("framed message is non-empty");
+        let decoded: ServerMessage =
+            read_message_with_prefix_byte(&mut &rest[..], *first, MAX_FRAME_SIZE).unwrap();
+        assert_eq!(msg, decoded);
+
+        // The same holds when the remainder arrives in small chunks.
+        let mut chunked = ChunkedReader::new(rest.to_vec(), 3);
+        let decoded: ServerMessage =
+            read_message_with_prefix_byte(&mut chunked, *first, MAX_FRAME_SIZE).unwrap();
+        assert_eq!(msg, decoded);
+    }
+
+    #[test]
+    fn framing_resume_rejects_an_oversized_claimed_length() {
+        // The size guard must apply to the resumed path too, or a hostile origin
+        // could bypass it by virtue of the first byte already being consumed.
+        let mut buf = Vec::new();
+        write_message(&mut buf, &ClientMessage::Input { data: vec![7; 500] }).unwrap();
+        let (first, rest) = buf.split_first().expect("framed message is non-empty");
+
+        let result: Result<ClientMessage, FramingError> =
+            read_message_with_prefix_byte(&mut &rest[..], *first, 64);
+        assert!(
+            matches!(result, Err(FramingError::Oversized { .. })),
+            "resumed read must still enforce the frame-size cap, got {result:?}"
+        );
     }
 
     // ---- Version negotiation ----
