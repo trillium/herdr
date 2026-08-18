@@ -408,15 +408,55 @@ pub(super) fn render_panes(
             render_copy_mode_cursor(app, frame, info);
         } else {
             // A pane with no local runtime. Foreign (federated) panes are
-            // projected read-only, so render the live-view status placeholder in
-            // place of a blank grid instead of crashing or leaving the pane empty.
+            // projected read-only. When a live frame is available from an
+            // observer (N3), render it; otherwise show the N2 status placeholder.
             if app.federation_enabled {
-                render_foreign_live_view_placeholder(app, ws, info, frame);
+                let has_frame = ws
+                    .terminal_id(info.id)
+                    .and_then(|terminal_id| app.foreign_frames.get(terminal_id))
+                    .and_then(|frame| frame.to_ratatui_buffer())
+                    .map(|buffer| {
+                        render_foreign_frame_buffer(&buffer, info.inner_rect, frame);
+                        true
+                    })
+                    .unwrap_or(false);
+                if !has_frame {
+                    render_foreign_live_view_placeholder(app, ws, info, frame);
+                }
             }
         }
     }
 
     render_pane_borders(app, ws, pane_infos, split_borders, frame);
+}
+
+/// Blit cells from a foreign frame's ratatui Buffer into the render frame at
+/// the pane area, cropping to the minimum of frame size and pane area.
+fn render_foreign_frame_buffer(
+    buffer: &ratatui::buffer::Buffer,
+    pane_area: Rect,
+    frame: &mut Frame,
+) {
+    let buf = frame.buffer_mut();
+    let src_area = buffer.area;
+    let copy_width = src_area.width.min(pane_area.width);
+    let copy_height = src_area.height.min(pane_area.height);
+    for y in 0..copy_height {
+        for x in 0..copy_width {
+            if let Some(src_cell) = buffer.cell((x, y)) {
+                let dst_x = pane_area.x + x;
+                let dst_y = pane_area.y + y;
+                if dst_x < buf.area.width && dst_y < buf.area.height {
+                    let dst = &mut buf[(dst_x, dst_y)];
+                    dst.set_symbol(src_cell.symbol());
+                    dst.fg = src_cell.fg;
+                    dst.bg = src_cell.bg;
+                    dst.modifier = src_cell.modifier;
+                    dst.skip = src_cell.skip;
+                }
+            }
+        }
+    }
 }
 
 /// Render the N2 live-view status for a foreign pane (no local runtime): the
