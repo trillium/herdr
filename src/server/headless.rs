@@ -127,7 +127,8 @@ enum LoopEvent {
     Api(Box<api::ApiRequestMessage>),
     ServerEvent(ServerEvent),
     RenderRequested,
-    ForeignRows(crate::federation::ForeignRows),
+    ForeignRows(crate::federation::ForeignRowsMessage),
+    ForeignFrame(crate::federation::ForeignFrame),
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
@@ -822,7 +823,11 @@ impl HeadlessServer {
                         // The app holds a live `foreign_rows_tx`, so the channel
                         // never fully closes: `None` cannot occur and, with no
                         // poll task, this branch simply pends.
-                        Some(rows) => LoopEvent::ForeignRows(rows),
+                        Some(msg) => LoopEvent::ForeignRows(msg),
+                        None => LoopEvent::Timer,
+                    },
+                    maybe_frame = self.app.foreign_frame_rx.recv() => match maybe_frame {
+                        Some(frame) => LoopEvent::ForeignFrame(frame),
                         None => LoopEvent::Timer,
                     },
                     _ = sleep_until_or_pending(next_deadline) => LoopEvent::Timer,
@@ -905,12 +910,26 @@ impl HeadlessServer {
                         needs_render = true;
                     }
                 }
-                LoopEvent::ForeignRows(rows) => {
+                LoopEvent::ForeignRows(
+                    crate::federation::ForeignRowsMessage::OriginsDiscovered(origins),
+                ) => {
+                    self.app.federation_origins = origins;
+                }
+                LoopEvent::ForeignRows(crate::federation::ForeignRowsMessage::Rows(rows)) => {
                     // `apply_foreign_rows` is the flag-gated seam: it projects the
                     // rows when federation is enabled and clears them (ignoring
                     // `rows`) when it is not, so a tick that races a disable is a
                     // safe no-op.
                     self.app.state.apply_foreign_rows(rows);
+                    self.app.reconcile_foreign_observers();
+                    needs_render = true;
+                    needs_full_render = true;
+                }
+                LoopEvent::ForeignFrame(frame) => {
+                    self.app
+                        .state
+                        .foreign_frames
+                        .insert(frame.terminal_id.clone(), frame.frame);
                     needs_render = true;
                     needs_full_render = true;
                 }
@@ -10494,13 +10513,17 @@ next_tab = ""
         server
             .app
             .foreign_rows_tx
-            .try_send(rows)
+            .try_send(crate::federation::ForeignRowsMessage::Rows(rows))
             .expect("foreign rows channel has capacity");
-        let delivered = server
+        let delivered = match server
             .app
             .foreign_rows_rx
             .try_recv()
-            .expect("a foreign rows tick is queued");
+            .expect("a foreign rows tick is queued")
+        {
+            crate::federation::ForeignRowsMessage::Rows(r) => r,
+            _ => panic!("expected Rows variant, got OriginsDiscovered"),
+        };
         server.app.state.apply_foreign_rows(delivered);
 
         assert!(

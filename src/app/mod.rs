@@ -51,6 +51,10 @@ const FEDERATION_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
 /// each message replaces the whole foreign projection, so only the latest tick
 /// matters and backpressure on a slow run loop is harmless.
 const FOREIGN_ROWS_CHANNEL_CAP: usize = 4;
+/// Bounded capacity for the observer task -> run loop foreign-frame channel.
+/// Each message is one frame from one observer; capacity is generous so
+/// backpressure drops stale frames rather than stalling observers.
+const FOREIGN_FRAME_CHANNEL_CAP: usize = 64;
 const PENDING_AGENT_RESUME_THEME_WAIT: Duration = Duration::from_millis(750);
 const SESSION_SAVE_DEBOUNCE: Duration = Duration::from_secs(5);
 const SIDEBAR_DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(350);
@@ -174,11 +178,24 @@ pub struct App {
     /// Sender kept alive for the lifetime of the app so the foreign-rows channel
     /// never fully closes: the run loop's `recv()` then pends (rather than
     /// spinning on `None`) whenever no poll task is running.
-    pub(crate) foreign_rows_tx: mpsc::Sender<crate::federation::ForeignRows>,
-    /// Receiver drained by the run loop; each message is a full replacement of
-    /// the projected foreign rows for one poll tick (N1c).
-    pub(crate) foreign_rows_rx: mpsc::Receiver<crate::federation::ForeignRows>,
-    /// Handle to the running federation poll task, present only while
+    pub(crate) foreign_rows_tx: mpsc::Sender<crate::federation::ForeignRowsMessage>,
+    /// Receiver drained by the run loop; carries either the initial origin
+    /// discovery or a tick's worth of projected foreign rows (N1c).
+    pub(crate) foreign_rows_rx: mpsc::Receiver<crate::federation::ForeignRowsMessage>,
+    /// Sender for live frames from foreign observer tasks (N3).
+    pub(crate) foreign_frame_tx: mpsc::Sender<crate::federation::ForeignFrame>,
+    /// Receiver drained by the run loop; each message is one frame from one
+    /// foreign observer (N3).
+    pub(crate) foreign_frame_rx: mpsc::Receiver<crate::federation::ForeignFrame>,
+    /// Running foreign observer task handles, keyed by namespaced terminal id.
+    /// Dropping a handle aborts the observer.
+    pub(crate) foreign_observers:
+        HashMap<crate::terminal::TerminalId, crate::federation::ForeignObserveHandle>,
+    /// Origins discovered by the federation poll task, stored here so
+    /// `reconcile_foreign_observers` can look up API sockets without
+    /// re-discovering.
+    pub(crate) federation_origins: Vec<crate::federation::Origin>,
+    /// Handle to the running federation snapshot poll task, present only while
     /// `experimental.federation` was enabled at startup. `None` means no polling
     /// and therefore no federation network I/O.
     pub(crate) federation_poll: Option<FederationPollHandle>,
@@ -217,7 +234,9 @@ pub(crate) enum LoopEvent {
     RenderRequested,
     /// A federation poll tick delivered a full replacement of the projected
     /// foreign rows (N1c).
-    ForeignRows(crate::federation::ForeignRows),
+    ForeignRows(crate::federation::ForeignRowsMessage),
+    /// A live frame from a foreign observer task (N3).
+    ForeignFrame(crate::federation::ForeignFrame),
 }
 
 struct SyncOutputGuard;
@@ -430,7 +449,9 @@ impl App {
         crate::kitty_graphics::set_enabled(config.experimental.kitty_graphics);
         let (event_tx, event_rx) = mpsc::channel::<AppEvent>(APP_EVENT_CHANNEL_CAPACITY);
         let (foreign_rows_tx, foreign_rows_rx) =
-            mpsc::channel::<crate::federation::ForeignRows>(FOREIGN_ROWS_CHANNEL_CAP);
+            mpsc::channel::<crate::federation::ForeignRowsMessage>(FOREIGN_ROWS_CHANNEL_CAP);
+        let (foreign_frame_tx, foreign_frame_rx) =
+            mpsc::channel::<crate::federation::ForeignFrame>(FOREIGN_FRAME_CHANNEL_CAP);
         let render_notify = Arc::new(Notify::new());
         let render_dirty = Arc::new(crate::render_signal::RenderSignal::new());
 
@@ -709,6 +730,7 @@ impl App {
                 .switch_ascii_input_source_in_prefix,
             kitty_graphics_enabled: config.experimental.kitty_graphics,
             federation_enabled: config.experimental.federation,
+            foreign_frames: std::collections::HashMap::new(),
             default_shell: config.terminal.default_shell.clone(),
             shell_mode: config.terminal.shell_mode,
             new_terminal_cwd: config.terminal.new_cwd.clone(),
@@ -846,6 +868,10 @@ impl App {
             prefix_input_source: Box::new(crate::platform::RealPrefixInputSource::default()),
             foreign_rows_tx,
             foreign_rows_rx,
+            foreign_frame_tx,
+            foreign_frame_rx,
+            foreign_observers: HashMap::new(),
+            federation_origins: Vec::new(),
             federation_poll: None,
             federation_socket_dir: config
                 .experimental
@@ -1018,6 +1044,18 @@ impl App {
                 tracing::info!(count = origins.len(), "federation poll: polling origins");
             }
 
+            // Send the discovered origins to the run loop once so
+            // reconcile_foreign_observers can look up API sockets.
+            if tx
+                .send(crate::federation::ForeignRowsMessage::OriginsDiscovered(
+                    origins.clone(),
+                ))
+                .await
+                .is_err()
+            {
+                return;
+            }
+
             loop {
                 // Fetch every origin's snapshot on a blocking thread (ApiClient is
                 // synchronous), then hand the combined rows to the run loop.
@@ -1031,7 +1069,11 @@ impl App {
                 .await
                 {
                     Ok(rows) => {
-                        if tx.send(rows).await.is_err() {
+                        if tx
+                            .send(crate::federation::ForeignRowsMessage::Rows(rows))
+                            .await
+                            .is_err()
+                        {
                             // Run loop gone: nothing left to feed.
                             break;
                         }
@@ -1068,6 +1110,85 @@ impl App {
         if self.state.federation_enabled {
             self.spawn_federation_poll();
         }
+    }
+
+    /// Reconcile foreign observer tasks against the current set of foreign
+    /// terminals. Spawns observers for newly Attachable terminals, drops
+    /// handles for removed terminals, and evicts stale frames.
+    pub(crate) fn reconcile_foreign_observers(&mut self) {
+        if !self.state.federation_enabled || self.federation_origins.is_empty() {
+            return;
+        }
+
+        // Collect the set of namespaced terminal ids that are currently foreign
+        // and have Attachable live-view status.
+        let mut attachable: std::collections::HashSet<crate::terminal::TerminalId> =
+            std::collections::HashSet::new();
+        for terminal in self.state.terminals.values() {
+            if !crate::federation::is_foreign(&terminal.id) {
+                continue;
+            }
+            if crate::federation::live_view_status(terminal.foreign_remote_protocol)
+                != crate::federation::LiveViewStatus::Attachable
+            {
+                continue;
+            }
+            attachable.insert(terminal.id.clone());
+        }
+
+        // Drop observers for terminals that are no longer attachable.
+        self.foreign_observers
+            .retain(|terminal_id, _| attachable.contains(terminal_id));
+
+        // Spawn observers for newly attachable terminals.
+        for terminal_id in &attachable {
+            if self.foreign_observers.contains_key(terminal_id) {
+                continue;
+            }
+            let Some((origin_key, raw_terminal_id)) =
+                crate::federation::parse_foreign_terminal_id(terminal_id)
+            else {
+                continue;
+            };
+            let Some(origin) = self.federation_origins.iter().find(|o| o.key == origin_key) else {
+                continue;
+            };
+            let api_socket_path = match &origin.target {
+                crate::federation::ConnectionTarget::LocalSocket(path) => path.clone(),
+            };
+            let client_socket_path =
+                crate::server::socket_paths::derive_client_socket_from_api_socket(&api_socket_path);
+
+            // Use the view's pane area size if available, else 80x24.
+            let (cols, rows) = self
+                .state
+                .view
+                .pane_infos
+                .first()
+                .map(|info| (info.inner_rect.width, info.inner_rect.height))
+                .unwrap_or((80, 24));
+
+            tracing::info!(
+                terminal_id = %terminal_id,
+                origin = %origin_key,
+                "spawning foreign observer"
+            );
+
+            let handle = crate::federation::spawn_foreign_observer(
+                client_socket_path,
+                raw_terminal_id,
+                terminal_id.clone(),
+                cols,
+                rows,
+                self.foreign_frame_tx.clone(),
+            );
+            self.foreign_observers.insert(terminal_id.clone(), handle);
+        }
+
+        // Evict frames for terminals that are no longer foreign or attachable.
+        self.state
+            .foreign_frames
+            .retain(|terminal_id, _| attachable.contains(terminal_id));
     }
 
     pub async fn run(&mut self, terminal: &mut DefaultTerminal) -> io::Result<()> {
@@ -1303,7 +1424,11 @@ impl App {
                         // `self` holds a live `foreign_rows_tx`, so the channel
                         // never fully closes: `None` cannot occur and, with no
                         // poll task, this branch simply pends.
-                        Some(rows) => LoopEvent::ForeignRows(rows),
+                        Some(msg) => LoopEvent::ForeignRows(msg),
+                        None => LoopEvent::Timer,
+                    },
+                    maybe_frame = self.foreign_frame_rx.recv() => match maybe_frame {
+                        Some(frame) => LoopEvent::ForeignFrame(frame),
                         None => LoopEvent::Timer,
                     },
                     _ = sleep_until_or_pending(next_deadline) => LoopEvent::Timer,
@@ -1336,11 +1461,23 @@ impl App {
                         needs_render = true;
                     }
                 }
-                LoopEvent::ForeignRows(rows) => {
+                LoopEvent::ForeignRows(
+                    crate::federation::ForeignRowsMessage::OriginsDiscovered(origins),
+                ) => {
+                    self.federation_origins = origins;
+                }
+                LoopEvent::ForeignRows(crate::federation::ForeignRowsMessage::Rows(rows)) => {
                     // The flag-gated seam replaces the foreign projection when
                     // federation is enabled and clears it (ignoring `rows`) when
                     // it is not, so a tick that races a disable is a safe no-op.
                     self.state.apply_foreign_rows(rows);
+                    self.reconcile_foreign_observers();
+                    needs_render = true;
+                }
+                LoopEvent::ForeignFrame(frame) => {
+                    self.state
+                        .foreign_frames
+                        .insert(frame.terminal_id.clone(), frame.frame);
                     needs_render = true;
                 }
             }
@@ -3097,12 +3234,16 @@ mod tests {
         // Enabled: deliver a tick on the channel, drain + apply as the run loop
         // does, and assert the foreign rows reach both app state and the sidebar.
         app.foreign_rows_tx
-            .try_send(tick_rows())
+            .try_send(crate::federation::ForeignRowsMessage::Rows(tick_rows()))
             .expect("foreign rows channel has capacity");
-        let delivered = app
+        let delivered = match app
             .foreign_rows_rx
             .try_recv()
-            .expect("a foreign rows tick is queued");
+            .expect("a foreign rows tick is queued")
+        {
+            crate::federation::ForeignRowsMessage::Rows(r) => r,
+            _ => panic!("expected Rows variant, got OriginsDiscovered"),
+        };
         app.state.apply_foreign_rows(delivered);
 
         assert!(
@@ -3127,12 +3268,16 @@ mod tests {
         // disable is a safe no-op.
         app.state.federation_enabled = false;
         app.foreign_rows_tx
-            .try_send(tick_rows())
+            .try_send(crate::federation::ForeignRowsMessage::Rows(tick_rows()))
             .expect("foreign rows channel has capacity");
-        let delivered = app
+        let delivered = match app
             .foreign_rows_rx
             .try_recv()
-            .expect("a foreign rows tick is queued");
+            .expect("a foreign rows tick is queued")
+        {
+            crate::federation::ForeignRowsMessage::Rows(r) => r,
+            _ => panic!("expected Rows variant, got OriginsDiscovered"),
+        };
         app.state.apply_foreign_rows(delivered);
 
         assert!(

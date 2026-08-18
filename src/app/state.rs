@@ -1461,6 +1461,12 @@ pub struct AppState {
     /// splice. The flag is consulted only by the gated seam
     /// [`AppState::apply_foreign_rows`]; the splice itself is unconditional.
     pub federation_enabled: bool,
+    /// Cached live frames from remote observer connections (N3 live view).
+    /// Keyed by the namespaced foreign terminal id (`fed~<key>~<raw>`).
+    /// Updated by `LoopEvent::ForeignFrame`; rendered in place of the N2
+    /// placeholder when a frame is available.
+    pub foreign_frames:
+        std::collections::HashMap<crate::terminal::TerminalId, crate::protocol::FrameData>,
     pub default_shell: String,
     pub shell_mode: crate::config::ShellModeConfig,
     pub new_terminal_cwd: NewTerminalCwdConfig,
@@ -1963,6 +1969,7 @@ impl AppState {
             switch_ascii_input_source_in_prefix: false,
             kitty_graphics_enabled: false,
             federation_enabled: false,
+            foreign_frames: std::collections::HashMap::new(),
             default_shell: String::new(),
             shell_mode: crate::config::ShellModeConfig::Auto,
             new_terminal_cwd: NewTerminalCwdConfig::Follow,

@@ -30,6 +30,7 @@ mod ingest;
 mod label;
 mod live_view;
 mod namespace;
+mod observe;
 mod origin;
 mod poll;
 mod registry;
@@ -46,6 +47,17 @@ pub use namespace::{
     is_foreign, is_foreign_workspace_id, namespace_public_id, namespace_terminal_id,
     parse_foreign_terminal_id, parse_foreign_workspace_id,
 };
+pub use observe::{spawn_foreign_observer, ForeignFrame, ForeignObserveHandle};
 pub use origin::{ConnectionTarget, InvalidOriginKey, Origin, OriginKey};
 pub use poll::collect_foreign_rows;
 pub use registry::{FederationRegistry, ReconcileDelta};
+
+/// Message sent from the federation poll task to the run loop on the
+/// `foreign_rows` channel. Carries either the initial origin discovery
+/// (sent once at task start) or a tick's worth of projected foreign rows.
+pub enum ForeignRowsMessage {
+    /// The set of origins discovered at task startup.
+    OriginsDiscovered(Vec<Origin>),
+    /// A full replacement of the projected foreign rows for one poll tick.
+    Rows(ForeignRows),
+}
