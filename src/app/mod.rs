@@ -1198,10 +1198,7 @@ impl App {
 
     /// Drop all observer handles and evict all cached frames belonging to
     /// origins that the registry just removed from the discovered set.
-    fn drop_observers_for_removed_origins(
-        &mut self,
-        removed: &[crate::federation::OriginKey],
-    ) {
+    fn drop_observers_for_removed_origins(&mut self, removed: &[crate::federation::OriginKey]) {
         for origin_key in removed {
             self.foreign_observers.retain(|terminal_id, _| {
                 crate::federation::parse_foreign_terminal_id(terminal_id)
@@ -1490,8 +1487,7 @@ impl App {
                     crate::federation::ForeignRowsMessage::OriginsDiscovered(origins),
                 ) => {
                     let delta = self.federation_registry.reconcile(origins);
-                    self.federation_origins =
-                        self.federation_registry.iter().cloned().collect();
+                    self.federation_origins = self.federation_registry.iter().cloned().collect();
                     // Proactively drop observers and evict frames for origins
                     // that disappeared from discovery so cleanup doesn't wait
                     // for the next rows tick.
