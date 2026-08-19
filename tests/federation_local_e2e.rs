@@ -117,18 +117,13 @@ fn federation_local_pipeline() {
         })
         .expect("remote pane id and terminal_id");
 
-    // Send a marker to the remote pane so we can verify snapshot delivery.
+    // Send a marker to the remote pane and execute it so snapshot frames carry it.
+    // pane send-text joins all args after pane_id as text; no --text flag needed.
     cli_request(
         &binary,
         &remote,
         REMOTE_SESSION,
-        &[
-            "pane",
-            "send-text",
-            &remote_pane_id,
-            "--text",
-            &format!("printf {MARKER}\\n"),
-        ],
+        &["pane", "send-text", &remote_pane_id, &format!("printf {MARKER}\\n\n")],
     );
     thread::sleep(Duration::from_millis(500));
 
@@ -281,6 +276,8 @@ fn federation_local_pipeline() {
         Duration::from_secs(20),
     );
     // Verify input also reached the remote.
+    // Give the relay a moment to deliver and the PTY to process the command.
+    thread::sleep(Duration::from_millis(500));
     let remote_after_input = cli_request(
         &binary,
         &remote,
@@ -290,9 +287,9 @@ fn federation_local_pipeline() {
             "read",
             &remote_pane_id,
             "--source",
-            "recent",
+            "visible",
             "--lines",
-            "20",
+            "40",
         ],
     );
     assert!(
