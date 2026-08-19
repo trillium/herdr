@@ -1558,6 +1558,21 @@ impl AppState {
             .map(|ws| ws.id.clone());
         let focused_selected_id = self.workspaces.get(self.selected).map(|ws| ws.id.clone());
 
+        // Capture the focused terminal ID per foreign workspace *before* the
+        // strip. build_tab always finishes with focus on the last pane; without
+        // this, every poll tick resets pane focus to the rightmost pane even
+        // when the user explicitly navigated to a different one.
+        let focused_pane_terminal_ids: std::collections::HashMap<String, crate::terminal::TerminalId> = self
+            .workspaces
+            .iter()
+            .filter(|ws| crate::federation::is_foreign_workspace_id(&ws.id))
+            .filter_map(|ws| {
+                let pane_id = ws.focused_pane_id()?;
+                let terminal_id = ws.terminal_id(pane_id)?.clone();
+                Some((ws.id.clone(), terminal_id))
+            })
+            .collect();
+
         // Strip previously-injected foreign rows, keyed on the origin-namespace
         // predicate (never a raw string check) so repeated calls replace rather
         // than accumulate.
@@ -1582,6 +1597,26 @@ impl AppState {
         // Append after local workspaces; never insert before them, so any
         // `active`/`selected` index into local workspaces is preserved.
         self.workspaces.extend(rows.workspaces);
+
+        // Restore pane focus in each replaced foreign workspace. build_tab
+        // initialises focus to the last split pane, so without this step every
+        // poll tick resets focus to the rightmost pane.
+        for ws in &mut self.workspaces[local_count..] {
+            let Some(preferred_tid) = focused_pane_terminal_ids.get(&ws.id) else {
+                continue;
+            };
+            let tab = match ws.tabs.get_mut(ws.active_tab) {
+                Some(t) => t,
+                None => continue,
+            };
+            if let Some((&pane_id, _)) = tab
+                .panes
+                .iter()
+                .find(|(_, ps)| &ps.attached_terminal_id == preferred_tid)
+            {
+                tab.layout.focus_pane(pane_id);
+            }
+        }
 
         // Release-safe focus clamp: re-resolve focus by the identity captured
         // above and, when the focused workspace was removed, fall back to a
