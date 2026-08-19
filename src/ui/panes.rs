@@ -329,6 +329,19 @@ pub(super) fn compute_pane_infos(
                     cell_size.height_px,
                 );
             }
+        } else if resize_panes {
+            // Foreign pane: no local runtime. Propagate dimensions to the remote
+            // PTY through the control connection so the remote shell/application
+            // knows the actual viewport size.
+            if let Some(tid) = ws.terminal_id(info.id) {
+                if crate::federation::is_foreign(tid) {
+                    crate::app::input::terminal::send_foreign_pane_resize_if_changed(
+                        tid.as_str(),
+                        pane_inner.width,
+                        pane_inner.height,
+                    );
+                }
+            }
         }
 
         info.inner_rect = inner_rect;

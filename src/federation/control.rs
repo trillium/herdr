@@ -32,14 +32,24 @@ use crate::protocol::{
 };
 use crate::terminal::TerminalId;
 
+/// Command sent to a foreign controller over the control channel.
+#[derive(Debug)]
+pub enum ControlCommand {
+    /// Raw PTY input bytes to forward to the remote terminal.
+    Input(Vec<u8>),
+    /// Inform the remote server of the new viewport dimensions for this
+    /// terminal so it can issue TIOCSWINSZ to the PTY.
+    Resize { cols: u16, rows: u16 },
+}
+
 /// Handle for a running foreign controller task.
 ///
 /// Drop to abort the background task. The blocking socket-write thread may
 /// linger until the remote server closes the connection, but no more input
 /// will be forwarded to the remote.
 pub struct ForeignControlHandle {
-    /// Sender for raw input bytes to forward to the remote terminal.
-    pub tx: mpsc::Sender<Vec<u8>>,
+    /// Sender for control commands to forward to the remote terminal.
+    pub tx: mpsc::Sender<ControlCommand>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -70,7 +80,7 @@ pub fn spawn_foreign_controller(
     cols: u16,
     rows: u16,
 ) -> ForeignControlHandle {
-    let (tx, rx) = mpsc::channel::<Vec<u8>>(CONTROL_CHANNEL_CAP);
+    let (tx, rx) = mpsc::channel::<ControlCommand>(CONTROL_CHANNEL_CAP);
     let tx_for_handle = tx.clone();
     let task = tokio::spawn(async move {
         let mut rx = rx;
@@ -96,7 +106,7 @@ pub fn spawn_foreign_controller(
                     debug!(
                         terminal_id = %namespaced_terminal_id,
                         error = %err,
-                        "foreign controller: session error"
+                        "federation controller: session error"
                     );
                     rx = returned_rx;
                 }
@@ -148,8 +158,8 @@ fn run_controller_session(
     namespaced_terminal_id: &TerminalId,
     cols: u16,
     rows: u16,
-    rx: mpsc::Receiver<Vec<u8>>,
-) -> Result<mpsc::Receiver<Vec<u8>>, (ControlSessionError, mpsc::Receiver<Vec<u8>>)> {
+    rx: mpsc::Receiver<ControlCommand>,
+) -> Result<mpsc::Receiver<ControlCommand>, (ControlSessionError, mpsc::Receiver<ControlCommand>)> {
     use crate::protocol::{read_message, write_message};
 
     let mut stream = match crate::ipc::connect_local_stream(client_socket_path) {
@@ -219,10 +229,19 @@ fn run_controller_session(
         return Err((ControlSessionError::Framing(e), rx));
     }
 
-    // Forward input bytes until the connection is lost or the channel closes.
+    // Forward commands until the connection is lost or the channel closes.
     let mut rx = rx;
-    while let Some(bytes) = rx.blocking_recv() {
-        if write_message(&mut stream, &ClientMessage::Input { data: bytes }).is_err() {
+    while let Some(cmd) = rx.blocking_recv() {
+        let msg = match cmd {
+            ControlCommand::Input(data) => ClientMessage::Input { data },
+            ControlCommand::Resize { cols, rows } => ClientMessage::Resize {
+                cols,
+                rows,
+                cell_width_px: 0,
+                cell_height_px: 0,
+            },
+        };
+        if write_message(&mut stream, &msg).is_err() {
             debug!(
                 terminal_id = %namespaced_terminal_id,
                 "foreign controller: write failed, connection lost"

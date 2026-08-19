@@ -46,7 +46,7 @@ mod overlays;
 mod selection;
 mod settings;
 mod sidebar;
-mod terminal;
+pub(crate) mod terminal;
 
 pub(crate) use self::{
     lease::{ConsumedInputLease, ForwardedInputLease, InputLeaseKey, InputLeaseTable, RepeatPlan},

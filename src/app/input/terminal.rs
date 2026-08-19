@@ -35,21 +35,62 @@ fn relay_workers() -> &'static Mutex<HashMap<String, tokio::sync::mpsc::Sender<R
 
 /// Direct control senders for foreign terminals with active ControlTerminal
 /// connections. Keyed by namespaced terminal id (`fed~<key>~<raw>`).
-static CONTROL_SENDERS: OnceLock<Mutex<HashMap<String, tokio::sync::mpsc::Sender<Vec<u8>>>>> =
-    OnceLock::new();
+static CONTROL_SENDERS: OnceLock<
+    Mutex<
+        HashMap<
+            String,
+            tokio::sync::mpsc::Sender<crate::federation::ControlCommand>,
+        >,
+    >,
+> = OnceLock::new();
 
-fn control_senders() -> &'static Mutex<HashMap<String, tokio::sync::mpsc::Sender<Vec<u8>>>> {
+fn control_senders() -> &'static Mutex<
+    HashMap<String, tokio::sync::mpsc::Sender<crate::federation::ControlCommand>>,
+> {
     CONTROL_SENDERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Last resize (cols, rows) sent to each foreign terminal. Used to suppress
+/// redundant resize messages on every render tick.
+static LAST_SENT_RESIZE: OnceLock<Mutex<HashMap<String, (u16, u16)>>> = OnceLock::new();
+
+fn last_sent_resize() -> &'static Mutex<HashMap<String, (u16, u16)>> {
+    LAST_SENT_RESIZE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// Register a control sender for a foreign terminal. Called from
 /// `App::reconcile_foreign_connections` when a new controller is spawned.
 pub(crate) fn register_control_sender(
     namespaced_id: String,
-    tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    tx: tokio::sync::mpsc::Sender<crate::federation::ControlCommand>,
 ) {
     if let Ok(mut map) = control_senders().lock() {
         map.insert(namespaced_id, tx);
+    }
+}
+
+/// Send a PTY resize to a foreign terminal if the dimensions have changed.
+/// Called from compute_pane_infos for foreign panes.
+pub(crate) fn send_foreign_pane_resize_if_changed(namespaced_id: &str, cols: u16, rows: u16) {
+    if cols == 0 || rows == 0 {
+        return;
+    }
+
+    // Check whether dimensions actually changed before acquiring the sender lock.
+    if let Ok(mut sizes) = last_sent_resize().lock() {
+        let prev = sizes.get(namespaced_id).copied();
+        if prev == Some((cols, rows)) {
+            return;
+        }
+        sizes.insert(namespaced_id.to_string(), (cols, rows));
+    } else {
+        return;
+    }
+
+    if let Ok(map) = control_senders().lock() {
+        if let Some(tx) = map.get(namespaced_id) {
+            let _ = tx.try_send(crate::federation::ControlCommand::Resize { cols, rows });
+        }
     }
 }
 
@@ -533,7 +574,8 @@ impl App {
         let namespaced_id = terminal_id.as_str().to_string();
         if let Ok(map) = control_senders().lock() {
             if let Some(tx) = map.get(&namespaced_id) {
-                match tx.try_send(bytes.to_vec()) {
+                let cmd = crate::federation::ControlCommand::Input(bytes.to_vec());
+                match tx.try_send(cmd) {
                     Ok(()) => return,
                     Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                         warn!(

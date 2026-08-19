@@ -39,7 +39,7 @@ mod poll;
 mod registry;
 pub mod relay;
 
-pub use control::{spawn_foreign_controller, ForeignControlHandle};
+pub use control::{spawn_foreign_controller, ControlCommand, ForeignControlHandle};
 pub use discovery::{
     discover, discover_origins, forwarded_socket_path, DiscoveryConfig, StaticOrigin,
     TailscaleStatus,
