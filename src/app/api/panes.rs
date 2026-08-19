@@ -74,8 +74,7 @@ impl App {
                 let config_socket_dir = self.federation_socket_dir.clone();
                 let ok = origin_key.clone();
                 let result = tokio::task::block_in_place(|| {
-                    let origins =
-                        crate::federation::discover_origins(config_socket_dir.as_deref());
+                    let origins = crate::federation::discover_origins(config_socket_dir.as_deref());
                     let Some(origin) = origins.into_iter().find(|o| o.key == ok) else {
                         return Err("federation origin not found".to_string());
                     };
@@ -91,16 +90,22 @@ impl App {
                     Err(e) => encode_error(id, "pane_split_failed", e),
                     Ok(value) => {
                         let raw_pane_json = value["result"]["pane"].clone();
-                        let raw_pane_id =
-                            raw_pane_json["pane_id"].as_str().unwrap_or_default().to_string();
-                        let raw_terminal_id =
-                            raw_pane_json["terminal_id"].as_str().unwrap_or_default().to_string();
+                        let raw_pane_id = raw_pane_json["pane_id"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_string();
+                        let raw_terminal_id = raw_pane_json["terminal_id"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_string();
                         let raw_workspace_id = raw_pane_json["workspace_id"]
                             .as_str()
                             .unwrap_or_default()
                             .to_string();
-                        let raw_tab_id =
-                            raw_pane_json["tab_id"].as_str().unwrap_or_default().to_string();
+                        let raw_tab_id = raw_pane_json["tab_id"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_string();
                         match serde_json::from_value::<PaneInfo>(raw_pane_json) {
                             Ok(mut pane) => {
                                 pane.pane_id = crate::federation::namespace_public_id(
@@ -1648,6 +1653,28 @@ impl App {
         let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
+        // Foreign panes: route through the control connection (or relay fallback).
+        if let Some(ws) = self.state.workspaces.get(ws_idx) {
+            if let Some(tid) = ws.terminal_id(pane_id) {
+                if crate::federation::is_foreign(tid) {
+                    let bytes = match super::super::api_helpers::encode_api_input_legacy(
+                        &params.text,
+                        &params.keys,
+                    ) {
+                        Ok(b) => b,
+                        Err(key) => {
+                            return encode_error(
+                                id,
+                                "invalid_key",
+                                format!("unsupported key {key}"),
+                            )
+                        }
+                    };
+                    self.try_send_foreign_pane_input_headless(ws_idx, pane_id, &bytes);
+                    return encode_success(id, ResponseResult::Ok {});
+                }
+            }
+        }
         let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
@@ -1688,8 +1715,7 @@ impl App {
         if let Some(ws) = self.state.workspaces.get(ws_idx) {
             if let Some(tid) = ws.terminal_id(pane_id) {
                 if crate::federation::is_foreign(tid) {
-                    if let Some((origin_key, _)) =
-                        crate::federation::parse_foreign_terminal_id(tid)
+                    if let Some((origin_key, _)) = crate::federation::parse_foreign_terminal_id(tid)
                     {
                         let raw_pane_id = self
                             .state
@@ -1699,11 +1725,9 @@ impl App {
                             .unwrap_or_default();
                         crate::federation::relay::spawn_send_action_to_foreign(
                             origin_key,
-                            crate::api::schema::Method::PaneClose(
-                                crate::api::schema::PaneTarget {
-                                    pane_id: raw_pane_id,
-                                },
-                            ),
+                            crate::api::schema::Method::PaneClose(crate::api::schema::PaneTarget {
+                                pane_id: raw_pane_id,
+                            }),
                             std::time::Duration::from_secs(3),
                             self.federation_socket_dir.clone(),
                         );

@@ -204,9 +204,27 @@ impl App {
         let ws = self.state.workspaces.get(ws_idx)?;
         let pane_id = ws.focused_pane_id()?;
         let terminal_id = ws.terminal_id(pane_id)?.clone();
-        let rt =
-            self.state
-                .runtime_for_pane_in_workspace(&self.terminal_runtimes, ws_idx, pane_id)?;
+        let rt = self
+            .state
+            .runtime_for_pane_in_workspace(&self.terminal_runtimes, ws_idx, pane_id);
+
+        // Foreign panes have no local runtime. Encode with legacy VT100 and
+        // return so handle_terminal_key_headless_from can relay to the origin.
+        if rt.is_none() && crate::federation::is_foreign_workspace_id(&ws.id) {
+            let bytes =
+                crate::input::encode_terminal_key(key, crate::input::KeyboardProtocol::Legacy);
+            if bytes.is_empty() {
+                return None;
+            }
+            return Some(PreparedPaneInput {
+                ws_idx,
+                pane_id,
+                target: TerminalInputTarget { terminal_id },
+                bytes: Bytes::from(bytes),
+            });
+        }
+
+        let rt = rt?;
 
         // Intercept plain PageUp/PageDown presses for pane scrollback only
         // when the focused pane looks like a shell transcript. Normal-screen
