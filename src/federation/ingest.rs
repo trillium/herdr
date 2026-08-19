@@ -117,6 +117,24 @@ pub struct RemoteSnapshot {
     panes: Vec<RemotePane>,
     #[serde(default)]
     agents: Vec<RemotePane>,
+    #[serde(default)]
+    layouts: Vec<RemoteLayout>,
+}
+
+/// Minimal parse of a remote `PaneLayoutSnapshot` — we only need `tab_id` and
+/// the `splits[].direction` fields to reconstruct layout direction.
+#[derive(Debug, Clone, Default, Deserialize)]
+struct RemoteLayout {
+    #[serde(default)]
+    tab_id: String,
+    #[serde(default)]
+    splits: Vec<RemoteSplit>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct RemoteSplit {
+    #[serde(default)]
+    direction: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -442,9 +460,27 @@ impl WorkspaceAccum {
         let mut public_pane_numbers: HashMap<PaneId, usize> = HashMap::new();
         let mut next_public_pane_number = 1usize;
         for (idx, tab_accum) in self.tabs.into_iter().enumerate() {
+            // Read split directions for this tab from the remote layout snapshot.
+            // Order matches the split sequence in build_tab (root split first).
+            let split_directions: Vec<Direction> = snap
+                .layouts
+                .iter()
+                .find(|l| l.tab_id == tab_accum.id)
+                .map(|l| {
+                    l.splits
+                        .iter()
+                        .map(|s| match s.direction.as_deref() {
+                            Some("down") => Direction::Vertical,
+                            _ => Direction::Horizontal, // "right" or absent → horizontal
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+
             let tab = build_tab(
                 idx + 1,
                 &tab_accum.terminals,
+                &split_directions,
                 events.clone(),
                 render_notify.clone(),
                 render_dirty.clone(),
@@ -484,12 +520,13 @@ impl WorkspaceAccum {
 
 /// Build a single foreign [`Tab`] whose panes attach to `terminals` in order.
 ///
-/// Allocates one local [`PaneId`] per terminal (the root plus one split each),
-/// registers each pane's public number into `public_pane_numbers`, and advances
-/// `next_public_pane_number`. `terminals` is guaranteed non-empty by the caller.
+/// `split_directions` carries the direction for each successive split, derived
+/// from the remote's `PaneLayoutSnapshot`. Absent or short — falls back to
+/// `Direction::Horizontal` (side-by-side) for any split with no direction entry.
 fn build_tab(
     number: usize,
     terminals: &[TerminalId],
+    split_directions: &[Direction],
     events: mpsc::Sender<AppEvent>,
     render_notify: Arc<Notify>,
     render_dirty: Arc<RenderSignal>,
@@ -498,13 +535,17 @@ fn build_tab(
 ) -> Tab {
     let (mut layout, root_pane) = TileLayout::new();
     let mut pane_ids = vec![root_pane];
-    for _ in 1..terminals.len() {
+    for split_idx in 0..terminals.len().saturating_sub(1) {
         // Mirror the (test-only) `split_focused`: split the focused pane and move
         // focus to the new pane. Foreign panes never spawn a local runtime, so the
         // production `Tab` split path (with runtime rollback) does not apply here.
+        let direction = split_directions
+            .get(split_idx)
+            .copied()
+            .unwrap_or(Direction::Horizontal);
         let focus = layout.focused();
         let new_pane = layout
-            .split_pane(focus, Direction::Horizontal, 0.5)
+            .split_pane(focus, direction, 0.5)
             .expect("focused pane is in the layout");
         layout.focus_pane(new_pane);
         pane_ids.push(new_pane);
