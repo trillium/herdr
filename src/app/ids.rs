@@ -152,18 +152,19 @@ impl App {
     /// Find a pane by its terminal id string. Used to resolve foreign pane ids
     /// expressed as namespaced terminal ids, which are stable across hub poll
     /// renumbering cycles unlike hub-assigned pane numbers.
-    fn find_pane_by_terminal_id_str(
-        &self,
-        id: &str,
-    ) -> Option<(usize, crate::layout::PaneId)> {
+    fn find_pane_by_terminal_id_str(&self, id: &str) -> Option<(usize, crate::layout::PaneId)> {
         let target = crate::terminal::TerminalId::from_string(id);
-        self.state.workspaces.iter().enumerate().find_map(|(ws_idx, ws)| {
-            ws.tabs.iter().find_map(|tab| {
-                tab.panes.iter().find_map(|(pane_id, pane_state)| {
-                    (pane_state.attached_terminal_id == target).then_some((ws_idx, *pane_id))
+        self.state
+            .workspaces
+            .iter()
+            .enumerate()
+            .find_map(|(ws_idx, ws)| {
+                ws.tabs.iter().find_map(|tab| {
+                    tab.panes.iter().find_map(|(pane_id, pane_state)| {
+                        (pane_state.attached_terminal_id == target).then_some((ws_idx, *pane_id))
+                    })
                 })
             })
-        })
     }
 
     pub(crate) fn parse_current_public_pane_id(

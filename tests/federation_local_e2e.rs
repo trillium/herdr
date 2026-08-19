@@ -123,7 +123,12 @@ fn federation_local_pipeline() {
         &binary,
         &remote,
         REMOTE_SESSION,
-        &["pane", "send-text", &remote_pane_id, &format!("printf {MARKER}\\n\n")],
+        &[
+            "pane",
+            "send-text",
+            &remote_pane_id,
+            &format!("printf {MARKER}\\n\n"),
+        ],
     );
     thread::sleep(Duration::from_millis(500));
 
@@ -172,7 +177,8 @@ fn federation_local_pipeline() {
             .as_str()
             .unwrap_or_default()
             .starts_with(&format!("fed~{ORIGIN_KEY}~")),
-        "pane_id must be namespaced: got {:?}", foreign_pane["pane_id"]
+        "pane_id must be namespaced: got {:?}",
+        foreign_pane["pane_id"]
     );
     // The terminal_id field must also be namespaced.
     let terminal_id = string_field(foreign_pane, "terminal_id");

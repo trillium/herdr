@@ -1265,8 +1265,16 @@ fn render_workspace_list(
             }
         }
 
+        let is_foreign_ws =
+            app.federation_enabled && crate::federation::is_foreign_workspace_id(&ws.id);
         let name_style = if selected || is_active || is_dragged {
-            Style::default().fg(p.text).add_modifier(Modifier::BOLD)
+            if is_foreign_ws {
+                Style::default().fg(p.teal).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(p.text).add_modifier(Modifier::BOLD)
+            }
+        } else if is_foreign_ws {
+            Style::default().fg(p.teal).add_modifier(Modifier::DIM)
         } else {
             Style::default().fg(p.subtext0)
         };
@@ -1277,10 +1285,7 @@ fn render_workspace_list(
         // local hostname prefix here, gated behind the federation flag so the
         // default (flag off) rendering is unchanged.
         let label = if app.federation_enabled {
-            crate::federation::prefixed_workspace_label(
-                crate::federation::is_foreign_workspace_id(&ws.id),
-                &label,
-            )
+            crate::federation::prefixed_workspace_label(is_foreign_ws, &label)
         } else {
             label
         };
