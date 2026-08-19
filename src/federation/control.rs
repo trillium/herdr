@@ -26,6 +26,9 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
+#[cfg(unix)]
+use crate::protocol::{read_message_async, write_message_async};
+
 use crate::protocol::{
     ClientKeybindings, ClientLaunchMode, ClientMessage, FramingError, RenderEncoding,
     ServerMessage, MAX_FRAME_SIZE, PROTOCOL_VERSION,
@@ -80,42 +83,33 @@ pub fn spawn_foreign_controller(
     cols: u16,
     rows: u16,
 ) -> ForeignControlHandle {
-    let (tx, rx) = mpsc::channel::<ControlCommand>(CONTROL_CHANNEL_CAP);
+    let (tx, mut rx) = mpsc::channel::<ControlCommand>(CONTROL_CHANNEL_CAP);
     let tx_for_handle = tx.clone();
     let task = tokio::spawn(async move {
-        let mut rx = rx;
         loop {
-            let socket_path = client_socket_path.clone();
-            let raw_id = raw_terminal_id.clone();
-            let namespaced_id = namespaced_terminal_id.clone();
-
-            let result = tokio::task::spawn_blocking(move || {
-                run_controller_session(&socket_path, &raw_id, &namespaced_id, cols, rows, rx)
-            })
+            let err = run_controller_session(
+                &client_socket_path,
+                &raw_terminal_id,
+                &namespaced_terminal_id,
+                cols,
+                rows,
+                &mut rx,
+            )
             .await;
 
-            match result {
-                Ok(Ok(returned_rx)) => {
+            match err {
+                None => {
                     debug!(
                         terminal_id = %namespaced_terminal_id,
                         "foreign controller: session ended normally"
                     );
-                    rx = returned_rx;
                 }
-                Ok(Err((err, returned_rx))) => {
+                Some(e) => {
                     debug!(
                         terminal_id = %namespaced_terminal_id,
-                        error = %err,
-                        "federation controller: session error"
+                        error = %e,
+                        "foreign controller: session error"
                     );
-                    rx = returned_rx;
-                }
-                Err(_) => {
-                    warn!(
-                        terminal_id = %namespaced_terminal_id,
-                        "foreign controller: blocking task panicked, stopping"
-                    );
-                    break;
                 }
             }
 
@@ -145,29 +139,155 @@ pub fn spawn_foreign_controller(
 }
 
 /// Connect to the remote client socket, handshake, enter control mode, and
-/// forward input bytes from `rx` until the connection is lost or `rx` closes.
+/// forward commands from `rx` until the connection is lost or `rx` closes.
 ///
-/// Returns `Ok(rx)` on clean shutdown so the receiver can be reused across
-/// reconnects. Returns `Err((err, rx))` on failure.
+/// Returns `None` on clean shutdown, `Some(err)` on failure.
 ///
-/// Synchronous and blocking — run inside `tokio::task::spawn_blocking`.
-#[allow(clippy::type_complexity)]
-fn run_controller_session(
+/// On Unix this runs fully async inside the Tokio runtime, eliminating the
+/// thread-wakeup scheduling jitter that `spawn_blocking` introduced.
+/// On other platforms it falls back to the synchronous blocking path.
+async fn run_controller_session(
     client_socket_path: &std::path::Path,
     raw_terminal_id: &TerminalId,
     namespaced_terminal_id: &TerminalId,
     cols: u16,
     rows: u16,
-    rx: mpsc::Receiver<ControlCommand>,
-) -> Result<mpsc::Receiver<ControlCommand>, (ControlSessionError, mpsc::Receiver<ControlCommand>)> {
+    rx: &mut mpsc::Receiver<ControlCommand>,
+) -> Option<ControlSessionError> {
+    #[cfg(unix)]
+    {
+        run_controller_session_async(
+            client_socket_path,
+            raw_terminal_id,
+            namespaced_terminal_id,
+            cols,
+            rows,
+            rx,
+        )
+        .await
+        .err()
+    }
+
+    #[cfg(not(unix))]
+    {
+        run_controller_session_blocking(
+            client_socket_path,
+            raw_terminal_id,
+            namespaced_terminal_id,
+            cols,
+            rows,
+            rx,
+        )
+        .await
+    }
+}
+
+/// Async (Unix) implementation of the controller session.
+#[cfg(unix)]
+async fn run_controller_session_async(
+    client_socket_path: &std::path::Path,
+    raw_terminal_id: &TerminalId,
+    namespaced_terminal_id: &TerminalId,
+    cols: u16,
+    rows: u16,
+    rx: &mut mpsc::Receiver<ControlCommand>,
+) -> Result<(), ControlSessionError> {
+    let mut stream = tokio::net::UnixStream::connect(client_socket_path)
+        .await
+        .map_err(ControlSessionError::Connect)?;
+
+    write_message_async(
+        &mut stream,
+        &ClientMessage::Hello {
+            version: PROTOCOL_VERSION,
+            cols,
+            rows,
+            cell_width_px: 0,
+            cell_height_px: 0,
+            requested_encoding: RenderEncoding::SemanticFrame,
+            keybindings: ClientKeybindings::Server,
+            launch_mode: ClientLaunchMode::TerminalAttach,
+        },
+    )
+    .await
+    .map_err(ControlSessionError::Framing)?;
+
+    let welcome: ServerMessage = read_message_async(&mut stream, MAX_FRAME_SIZE)
+        .await
+        .map_err(ControlSessionError::Framing)?;
+
+    match welcome {
+        ServerMessage::Welcome {
+            error: Some(err), ..
+        } => {
+            return Err(ControlSessionError::Rejected(err));
+        }
+        ServerMessage::Welcome { version, .. } => {
+            if version != PROTOCOL_VERSION {
+                return Err(ControlSessionError::ProtocolMismatch {
+                    remote: version,
+                    local: PROTOCOL_VERSION,
+                });
+            }
+            info!(
+                terminal_id = %namespaced_terminal_id,
+                "foreign controller: connected (protocol {version})"
+            );
+        }
+        other => {
+            return Err(ControlSessionError::UnexpectedMessage(format!("{other:?}")));
+        }
+    }
+
+    write_message_async(
+        &mut stream,
+        &ClientMessage::ControlTerminal {
+            target: raw_terminal_id.as_str().to_owned(),
+            takeover: true,
+        },
+    )
+    .await
+    .map_err(ControlSessionError::Framing)?;
+
+    while let Some(cmd) = rx.recv().await {
+        let msg = match cmd {
+            ControlCommand::Input(data) => ClientMessage::Input { data },
+            ControlCommand::Resize { cols, rows } => ClientMessage::Resize {
+                cols,
+                rows,
+                cell_width_px: 0,
+                cell_height_px: 0,
+            },
+        };
+        if let Err(e) = write_message_async(&mut stream, &msg).await {
+            debug!(
+                terminal_id = %namespaced_terminal_id,
+                "foreign controller: write failed, connection lost"
+            );
+            return Err(ControlSessionError::Framing(e));
+        }
+    }
+
+    Ok(())
+}
+
+/// Blocking fallback implementation for non-Unix platforms.
+#[cfg(not(unix))]
+async fn run_controller_session_blocking(
+    client_socket_path: &std::path::Path,
+    raw_terminal_id: &TerminalId,
+    namespaced_terminal_id: &TerminalId,
+    cols: u16,
+    rows: u16,
+    rx: &mut mpsc::Receiver<ControlCommand>,
+) -> Option<ControlSessionError> {
     use crate::protocol::{read_message, write_message};
 
     let mut stream = match crate::ipc::connect_local_stream(client_socket_path) {
         Ok(s) => s,
-        Err(e) => return Err((ControlSessionError::Connect(e), rx)),
+        Err(e) => return Some(ControlSessionError::Connect(e)),
     };
 
-    // Handshake: Hello
     if let Err(e) = write_message(
         &mut stream,
         &ClientMessage::Hello {
@@ -181,29 +301,24 @@ fn run_controller_session(
             launch_mode: ClientLaunchMode::TerminalAttach,
         },
     ) {
-        return Err((ControlSessionError::Framing(e), rx));
+        return Some(ControlSessionError::Framing(e));
     }
 
-    // Read Welcome
     let welcome: ServerMessage = match read_message(&mut stream, MAX_FRAME_SIZE) {
         Ok(msg) => msg,
-        Err(e) => return Err((ControlSessionError::Framing(e), rx)),
+        Err(e) => return Some(ControlSessionError::Framing(e)),
     };
+
     match welcome {
         ServerMessage::Welcome {
             error: Some(err), ..
-        } => {
-            return Err((ControlSessionError::Rejected(err), rx));
-        }
+        } => return Some(ControlSessionError::Rejected(err)),
         ServerMessage::Welcome { version, .. } => {
             if version != PROTOCOL_VERSION {
-                return Err((
-                    ControlSessionError::ProtocolMismatch {
-                        remote: version,
-                        local: PROTOCOL_VERSION,
-                    },
-                    rx,
-                ));
+                return Some(ControlSessionError::ProtocolMismatch {
+                    remote: version,
+                    local: PROTOCOL_VERSION,
+                });
             }
             info!(
                 terminal_id = %namespaced_terminal_id,
@@ -211,14 +326,10 @@ fn run_controller_session(
             );
         }
         other => {
-            return Err((
-                ControlSessionError::UnexpectedMessage(format!("{other:?}")),
-                rx,
-            ));
+            return Some(ControlSessionError::UnexpectedMessage(format!("{other:?}")));
         }
     }
 
-    // Switch into control mode
     if let Err(e) = write_message(
         &mut stream,
         &ClientMessage::ControlTerminal {
@@ -226,11 +337,9 @@ fn run_controller_session(
             takeover: true,
         },
     ) {
-        return Err((ControlSessionError::Framing(e), rx));
+        return Some(ControlSessionError::Framing(e));
     }
 
-    // Forward commands until the connection is lost or the channel closes.
-    let mut rx = rx;
     while let Some(cmd) = rx.blocking_recv() {
         let msg = match cmd {
             ControlCommand::Input(data) => ClientMessage::Input { data },
@@ -250,7 +359,7 @@ fn run_controller_session(
         }
     }
 
-    Ok(rx)
+    None
 }
 
 #[derive(Debug)]

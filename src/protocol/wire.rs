@@ -977,6 +977,91 @@ fn read_exact_or_eof<R: Read>(reader: &mut R, buf: &mut [u8]) -> Result<(), Fram
 }
 
 // ---------------------------------------------------------------------------
+// Async framing helpers (Unix only — used by the federation async control path)
+// ---------------------------------------------------------------------------
+
+/// Serializes and writes a length-prefixed frame asynchronously.
+///
+/// Equivalent to [`write_message`] but works with tokio async writers.
+/// No user-space flush is needed; tokio's `UnixStream` writes go directly
+/// to the kernel socket buffer.
+#[cfg(unix)]
+pub async fn write_message_async<W, M>(writer: &mut W, msg: &M) -> Result<(), FramingError>
+where
+    W: tokio::io::AsyncWriteExt + Unpin,
+    M: Serialize,
+{
+    let payload = bincode::serde::encode_to_vec(msg, bincode::config::standard())
+        .map_err(|e| FramingError::Bincode(e.to_string()))?;
+    let len = payload.len();
+    if len > u32::MAX as usize {
+        return Err(FramingError::Bincode(format!(
+            "payload length {len} exceeds u32::MAX ({})",
+            u32::MAX
+        )));
+    }
+    writer
+        .write_all(&(len as u32).to_le_bytes())
+        .await
+        .map_err(FramingError::Io)?;
+    writer.write_all(&payload).await.map_err(FramingError::Io)?;
+    Ok(())
+}
+
+/// Reads and deserializes a length-prefixed frame asynchronously.
+///
+/// Equivalent to [`read_message`] but works with tokio async readers.
+#[cfg(unix)]
+pub async fn read_message_async<R, M>(
+    reader: &mut R,
+    max_frame_size: usize,
+) -> Result<M, FramingError>
+where
+    R: tokio::io::AsyncReadExt + Unpin,
+    M: for<'de> Deserialize<'de>,
+{
+    use tokio::io::AsyncReadExt;
+
+    let mut len_buf = [0u8; LENGTH_PREFIX_BYTES];
+    reader.read_exact(&mut len_buf).await.map_err(|e| {
+        if e.kind() == io::ErrorKind::UnexpectedEof {
+            FramingError::UnexpectedEof
+        } else {
+            FramingError::Io(e)
+        }
+    })?;
+
+    let claimed_len = u32::from_le_bytes(len_buf) as usize;
+    if claimed_len > max_frame_size {
+        return Err(FramingError::Oversized {
+            claimed: claimed_len,
+            max: max_frame_size,
+        });
+    }
+
+    let mut payload = vec![0u8; claimed_len];
+    reader.read_exact(&mut payload).await.map_err(|e| {
+        if e.kind() == io::ErrorKind::UnexpectedEof {
+            FramingError::UnexpectedEof
+        } else {
+            FramingError::Io(e)
+        }
+    })?;
+
+    let (msg, consumed) =
+        bincode::serde::decode_from_slice(&payload, bincode::config::standard())
+            .map_err(|e| FramingError::Bincode(e.to_string()))?;
+
+    if consumed != claimed_len {
+        return Err(FramingError::Bincode(format!(
+            "decoded {consumed} bytes but payload length was {claimed_len}; trailing bytes are not allowed"
+        )));
+    }
+
+    Ok(msg)
+}
+
+// ---------------------------------------------------------------------------
 // Version negotiation
 // ---------------------------------------------------------------------------
 
