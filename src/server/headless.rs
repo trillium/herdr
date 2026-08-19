@@ -921,7 +921,7 @@ impl HeadlessServer {
                     // `rows`) when it is not, so a tick that races a disable is a
                     // safe no-op.
                     self.app.state.apply_foreign_rows(rows);
-                    self.app.reconcile_foreign_observers();
+                    self.app.reconcile_foreign_connections();
                     needs_render = true;
                     needs_full_render = true;
                 }

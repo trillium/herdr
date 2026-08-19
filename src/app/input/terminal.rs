@@ -33,6 +33,36 @@ fn relay_workers() -> &'static Mutex<HashMap<String, tokio::sync::mpsc::Sender<R
     RELAY_WORKERS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Direct control senders for foreign terminals with active ControlTerminal
+/// connections. Keyed by namespaced terminal id (`fed~<key>~<raw>`).
+static CONTROL_SENDERS: OnceLock<Mutex<HashMap<String, tokio::sync::mpsc::Sender<Vec<u8>>>>> =
+    OnceLock::new();
+
+fn control_senders() -> &'static Mutex<HashMap<String, tokio::sync::mpsc::Sender<Vec<u8>>>> {
+    CONTROL_SENDERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Register a control sender for a foreign terminal. Called from
+/// `App::reconcile_foreign_connections` when a new controller is spawned.
+pub(crate) fn register_control_sender(
+    namespaced_id: String,
+    tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+) {
+    if let Ok(mut map) = control_senders().lock() {
+        map.insert(namespaced_id, tx);
+    }
+}
+
+/// Unregister control senders for terminals that are no longer in the
+/// attachable set. Called from `App::reconcile_foreign_connections`.
+pub(crate) fn unregister_control_senders_not_in(
+    keep: &std::collections::HashSet<crate::terminal::TerminalId>,
+) {
+    if let Ok(mut map) = control_senders().lock() {
+        map.retain(|id, _| keep.iter().any(|t| t.as_str() == id));
+    }
+}
+
 enum PreparedPopupInput {
     NotOpen,
     Consumed,
@@ -449,7 +479,7 @@ impl App {
     /// Checks if the pane belongs to a foreign workspace; if so, routes the input
     /// through a bounded FIFO channel to ensure keystroke ordering and prevent
     /// unbounded task growth. Errors are logged and never block the UI.
-    fn try_send_foreign_pane_input_headless(
+    pub(crate) fn try_send_foreign_pane_input_headless(
         &self,
         ws_idx: usize,
         pane_id: crate::layout::PaneId,
@@ -478,6 +508,28 @@ impl App {
         let Some(terminal_id) = ws.terminal_id(pane_id) else {
             return;
         };
+
+        // Prefer the direct ControlTerminal connection when available (Attachable
+        // remotes). This path bypasses the JSON API relay and sends input through
+        // the live wire.
+        let namespaced_id = terminal_id.as_str().to_string();
+        if let Ok(map) = control_senders().lock() {
+            if let Some(tx) = map.get(&namespaced_id) {
+                match tx.try_send(bytes.to_vec()) {
+                    Ok(()) => return,
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        warn!(
+                            terminal_id = %namespaced_id,
+                            "control sender full, dropping keystroke"
+                        );
+                        return;
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                        // Handle is gone; fall through to relay.
+                    }
+                }
+            }
+        }
 
         // Extract the raw (non-namespaced) terminal id from fed~<key>~<raw>
         let raw_terminal_id = match crate::federation::parse_foreign_terminal_id(terminal_id) {

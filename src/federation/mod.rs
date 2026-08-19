@@ -27,6 +27,7 @@
 // dead-code lints suppressed intentionally — public API surface, not dead code.
 #![allow(dead_code, unused_imports)]
 
+mod control;
 mod discovery;
 mod ingest;
 mod label;
@@ -38,6 +39,7 @@ mod poll;
 mod registry;
 pub mod relay;
 
+pub use control::{spawn_foreign_controller, ForeignControlHandle};
 pub use discovery::{
     discover, discover_origins, forwarded_socket_path, DiscoveryConfig, StaticOrigin,
     TailscaleStatus,

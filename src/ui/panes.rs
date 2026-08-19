@@ -1688,4 +1688,78 @@ mod tests {
         };
         assert!(relative_luminance((r, g, b)) > relative_luminance((12, 14, 16)));
     }
+
+    #[test]
+    fn render_foreign_frame_buffer_copies_cells_to_destination() {
+        // Build a source buffer with known content.
+        let src_area = Rect::new(0, 0, 4, 2);
+        let mut src = ratatui::buffer::Buffer::filled(src_area, ratatui::buffer::Cell::new(" "));
+        src.cell_mut((0, 0)).unwrap().set_symbol("A");
+        src.cell_mut((1, 0)).unwrap().set_symbol("B");
+        src.cell_mut((2, 0)).unwrap().set_symbol("C");
+        src.cell_mut((3, 0)).unwrap().set_symbol("D");
+        src.cell_mut((0, 1)).unwrap().set_symbol("E");
+        src.cell_mut((1, 1)).unwrap().set_symbol("F");
+        src.cell_mut((2, 1)).unwrap().set_symbol("G");
+        src.cell_mut((3, 1)).unwrap().set_symbol("H");
+
+        // Set up a destination Frame via TestBackend.
+        let backend = ratatui::backend::TestBackend::new(10, 5);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+
+        // Pane area is a 4×2 region offset at (2, 1) inside the 10×5 frame.
+        let pane_area = Rect::new(2, 1, 4, 2);
+
+        terminal
+            .draw(|frame| {
+                render_foreign_frame_buffer(&src, pane_area, frame);
+            })
+            .unwrap();
+
+        let buf = terminal.backend().buffer();
+
+        // Verify cells landed at the correct destination positions.
+        assert_eq!(buf.cell((2, 1)).unwrap().symbol(), "A");
+        assert_eq!(buf.cell((3, 1)).unwrap().symbol(), "B");
+        assert_eq!(buf.cell((4, 1)).unwrap().symbol(), "C");
+        assert_eq!(buf.cell((5, 1)).unwrap().symbol(), "D");
+        assert_eq!(buf.cell((2, 2)).unwrap().symbol(), "E");
+        assert_eq!(buf.cell((3, 2)).unwrap().symbol(), "F");
+        assert_eq!(buf.cell((4, 2)).unwrap().symbol(), "G");
+        assert_eq!(buf.cell((5, 2)).unwrap().symbol(), "H");
+
+        // Verify cells outside the pane area are untouched (still default).
+        assert_eq!(buf.cell((0, 0)).unwrap().symbol(), " ");
+        assert_eq!(buf.cell((2, 0)).unwrap().symbol(), " ");
+        assert_eq!(buf.cell((2, 3)).unwrap().symbol(), " ");
+    }
+
+    #[test]
+    fn render_foreign_frame_buffer_crops_to_pane_area() {
+        // Source is larger than the pane area — should crop, not overflow.
+        let src_area = Rect::new(0, 0, 6, 4);
+        let mut src = ratatui::buffer::Buffer::filled(src_area, ratatui::buffer::Cell::new(" "));
+        src.cell_mut((0, 0)).unwrap().set_symbol("X");
+        src.cell_mut((5, 3)).unwrap().set_symbol("Y");
+
+        let backend = ratatui::backend::TestBackend::new(10, 10);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+
+        // Pane area is only 3×2 — should show only the top-left 3×2 of the source.
+        let pane_area = Rect::new(1, 1, 3, 2);
+
+        terminal
+            .draw(|frame| {
+                render_foreign_frame_buffer(&src, pane_area, frame);
+            })
+            .unwrap();
+
+        let buf = terminal.backend().buffer();
+
+        // Top-left corner of source lands at pane offset.
+        assert_eq!(buf.cell((1, 1)).unwrap().symbol(), "X");
+        // Cell (5,3) is outside the 3×2 pane area — should NOT appear.
+        // The cell at the pane area's bottom-right should be the source's (2,1).
+        assert_eq!(buf.cell((3, 2)).unwrap().symbol(), " ");
+    }
 }

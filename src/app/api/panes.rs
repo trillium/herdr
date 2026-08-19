@@ -46,6 +46,88 @@ impl App {
         let Some((ws_idx, target_pane_id)) = target else {
             return encode_error(id, "pane_not_found", "pane not found");
         };
+
+        // Foreign pane routing: route the split to the owning remote origin,
+        // return a namespaced pane id so the caller can reference the new pane.
+        {
+            let maybe_foreign = self.state.workspaces.get(ws_idx).and_then(|ws| {
+                let tid = ws.terminal_id(target_pane_id)?;
+                if !crate::federation::is_foreign(tid) {
+                    return None;
+                }
+                let (origin_key, _) = crate::federation::parse_foreign_terminal_id(tid)?;
+                let raw_ws = crate::federation::parse_foreign_workspace_id(&ws.id)
+                    .map(|(_, raw)| raw.to_string());
+                let raw_pane = self
+                    .state
+                    .terminals
+                    .get(tid)
+                    .and_then(|t| t.foreign_remote_pane_id.clone());
+                Some((origin_key, raw_ws, raw_pane))
+            });
+
+            if let Some((origin_key, raw_ws, raw_pane)) = maybe_foreign {
+                let mut remote_params = params.clone();
+                remote_params.workspace_id = raw_ws;
+                remote_params.target_pane_id = raw_pane;
+
+                let config_socket_dir = self.federation_socket_dir.clone();
+                let ok = origin_key.clone();
+                let result = tokio::task::block_in_place(|| {
+                    let origins =
+                        crate::federation::discover_origins(config_socket_dir.as_deref());
+                    let Some(origin) = origins.into_iter().find(|o| o.key == ok) else {
+                        return Err("federation origin not found".to_string());
+                    };
+                    crate::federation::relay::call_action_on_foreign_with_response(
+                        &origin,
+                        &crate::api::schema::Method::PaneSplit(remote_params),
+                        std::time::Duration::from_secs(3),
+                    )
+                    .map_err(|e| e.to_string())
+                });
+
+                return match result {
+                    Err(e) => encode_error(id, "pane_split_failed", e),
+                    Ok(value) => {
+                        let raw_pane_json = value["result"]["pane"].clone();
+                        let raw_pane_id =
+                            raw_pane_json["pane_id"].as_str().unwrap_or_default().to_string();
+                        let raw_terminal_id =
+                            raw_pane_json["terminal_id"].as_str().unwrap_or_default().to_string();
+                        let raw_workspace_id = raw_pane_json["workspace_id"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_string();
+                        let raw_tab_id =
+                            raw_pane_json["tab_id"].as_str().unwrap_or_default().to_string();
+                        match serde_json::from_value::<PaneInfo>(raw_pane_json) {
+                            Ok(mut pane) => {
+                                pane.pane_id = crate::federation::namespace_public_id(
+                                    &origin_key,
+                                    &raw_pane_id,
+                                );
+                                pane.terminal_id = crate::federation::namespace_public_id(
+                                    &origin_key,
+                                    &raw_terminal_id,
+                                );
+                                pane.workspace_id = crate::federation::namespace_public_id(
+                                    &origin_key,
+                                    &raw_workspace_id,
+                                );
+                                pane.tab_id = crate::federation::namespace_public_id(
+                                    &origin_key,
+                                    &raw_tab_id,
+                                );
+                                encode_success(id, ResponseResult::PaneInfo { pane })
+                            }
+                            Err(e) => encode_error(id, "pane_split_failed", e.to_string()),
+                        }
+                    }
+                };
+            }
+        }
+
         let extra_env = match super::env::normalize_launch_env(params.env) {
             Ok(env) => env,
             Err((code, message)) => return encode_error(id, &code, message),
@@ -1193,15 +1275,47 @@ impl App {
         let Some(public_pane_id) = self.public_pane_id(ws_idx, pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
-        let Some((pane, workspace_id)) = self.lookup_runtime(ws_idx, pane_id) else {
-            return pane_not_found(id, &params.pane_id);
-        };
         let Some(tab_idx) = self
             .state
             .workspaces
             .get(ws_idx)
             .and_then(|ws| ws.find_tab_index_for_pane(pane_id))
         else {
+            return pane_not_found(id, &params.pane_id);
+        };
+
+        // Foreign panes: read text from the live frame buffer instead of a
+        // local terminal runtime (which does not exist for remote panes).
+        if let Some(ws) = self.state.workspaces.get(ws_idx) {
+            if let Some(tid) = ws.terminal_id(pane_id) {
+                if crate::federation::is_foreign(tid) {
+                    let workspace_id = ws.id.clone();
+                    let text = self
+                        .state
+                        .foreign_frames
+                        .get(tid)
+                        .map(|frame| frame_to_visible_text(frame, params.lines))
+                        .unwrap_or_default();
+                    return encode_success(
+                        id,
+                        ResponseResult::PaneRead {
+                            read: PaneReadResult {
+                                pane_id: public_pane_id,
+                                workspace_id,
+                                tab_id: self.public_tab_id(ws_idx, tab_idx).unwrap(),
+                                source: params.source,
+                                format: params.format,
+                                text,
+                                revision: 0,
+                                truncated: false,
+                            },
+                        },
+                    );
+                }
+            }
+        }
+
+        let Some((pane, workspace_id)) = self.lookup_runtime(ws_idx, pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
         let snapshot = crate::app::api_helpers::read_terminal_snapshot(
@@ -1506,6 +1620,16 @@ impl App {
         let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
+        // Foreign panes: route through the control connection (or relay fallback)
+        if let Some(ws) = self.state.workspaces.get(ws_idx) {
+            if let Some(tid) = ws.terminal_id(pane_id) {
+                if crate::federation::is_foreign(tid) {
+                    let bytes = params.text.as_bytes().to_vec();
+                    self.try_send_foreign_pane_input_headless(ws_idx, pane_id, &bytes);
+                    return encode_success(id, ResponseResult::Ok {});
+                }
+            }
+        }
         let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
@@ -1557,6 +1681,37 @@ impl App {
         let Some(public_pane_id) = self.public_pane_id(ws_idx, pane_id) else {
             return Err(pane_not_found(id, &target.pane_id));
         };
+
+        // Foreign pane routing: fire the close to the owning remote origin
+        // (fire-and-forget), then fall through to local optimistic removal so
+        // the pane disappears immediately instead of waiting for the next poll.
+        if let Some(ws) = self.state.workspaces.get(ws_idx) {
+            if let Some(tid) = ws.terminal_id(pane_id) {
+                if crate::federation::is_foreign(tid) {
+                    if let Some((origin_key, _)) =
+                        crate::federation::parse_foreign_terminal_id(tid)
+                    {
+                        let raw_pane_id = self
+                            .state
+                            .terminals
+                            .get(tid)
+                            .and_then(|t| t.foreign_remote_pane_id.clone())
+                            .unwrap_or_default();
+                        crate::federation::relay::spawn_send_action_to_foreign(
+                            origin_key,
+                            crate::api::schema::Method::PaneClose(
+                                crate::api::schema::PaneTarget {
+                                    pane_id: raw_pane_id,
+                                },
+                            ),
+                            std::time::Duration::from_secs(3),
+                            self.federation_socket_dir.clone(),
+                        );
+                    }
+                }
+            }
+        }
+
         let workspace_id = self.public_workspace_id(ws_idx);
         let layout_update_target = self.layout_update_target_after_pane_removal(ws_idx, pane_id);
         if self.state.close_pane_would_close_workspace(ws_idx, pane_id)
@@ -1666,6 +1821,27 @@ fn normalize_state_labels(
         })
         .filter_map(Result::transpose)
         .collect()
+}
+
+fn frame_to_visible_text(frame: &crate::protocol::FrameData, lines: Option<u32>) -> String {
+    let line_limit = lines.map(|l| l.min(1000) as usize);
+    let mut rows: Vec<String> = Vec::with_capacity(frame.height as usize);
+    for row in 0..frame.height {
+        let mut row_str = String::with_capacity(frame.width as usize);
+        for col in 0..frame.width {
+            let idx = (row as usize) * (frame.width as usize) + (col as usize);
+            if let Some(cell) = frame.cells.get(idx) {
+                row_str.push_str(&cell.symbol);
+            }
+        }
+        rows.push(row_str);
+    }
+    if let Some(limit) = line_limit {
+        let start = rows.len().saturating_sub(limit);
+        rows[start..].join("\n")
+    } else {
+        rows.join("\n")
+    }
 }
 
 fn pane_not_found(id: String, pane_id: &str) -> String {
@@ -1905,6 +2081,7 @@ mod tests {
         api::schema::{ErrorResponse, SplitDirection, SuccessResponse},
         config::Config,
         detect::{Agent, AgentState},
+        protocol::CellData,
         workspace::Workspace,
     };
 
@@ -4113,5 +4290,195 @@ mod tests {
 
             assert_eq!(metadata_error_code(&response), "invalid_metadata_ttl");
         }
+    }
+
+    fn test_cell(symbol: &str) -> CellData {
+        CellData {
+            symbol: symbol.to_string(),
+            fg: 0,
+            bg: 0,
+            modifier: 0,
+            skip: false,
+            hyperlink: None,
+        }
+    }
+
+    #[test]
+    fn frame_to_visible_text_extracts_row_content() {
+        use crate::protocol::FrameData;
+        let frame = FrameData {
+            cells: vec![
+                test_cell("H"),
+                test_cell("i"),
+                test_cell(" "),
+                test_cell(" "),
+                test_cell("a"),
+                test_cell("b"),
+                test_cell("c"),
+                test_cell(" "),
+                test_cell(" "),
+                test_cell(" "),
+                test_cell(" "),
+                test_cell("x"),
+            ],
+            width: 4,
+            height: 3,
+            cursor: None,
+            hyperlinks: Vec::new(),
+            graphics: Vec::new(),
+        };
+        let text = frame_to_visible_text(&frame, None);
+        assert_eq!(text, "Hi  \nabc \n   x");
+    }
+
+    #[test]
+    fn frame_to_visible_text_line_limit_truncates() {
+        use crate::protocol::FrameData;
+        let frame = FrameData {
+            cells: vec![
+                test_cell("a"),
+                test_cell("b"),
+                test_cell("c"),
+                test_cell("d"),
+            ],
+            width: 2,
+            height: 2,
+            cursor: None,
+            hyperlinks: Vec::new(),
+            graphics: Vec::new(),
+        };
+        let text = frame_to_visible_text(&frame, Some(1));
+        assert_eq!(text, "cd");
+    }
+
+    #[test]
+    fn frame_to_visible_text_empty_frame() {
+        use crate::protocol::FrameData;
+        let frame = FrameData {
+            cells: Vec::new(),
+            width: 0,
+            height: 0,
+            cursor: None,
+            hyperlinks: Vec::new(),
+            graphics: Vec::new(),
+        };
+        let text = frame_to_visible_text(&frame, None);
+        assert_eq!(text, "");
+    }
+
+    fn app_with_foreign_workspace() -> (App, String, crate::terminal::TerminalId) {
+        use crate::federation::{ConnectionTarget, Origin, OriginKey, RemoteSnapshot};
+        let body = include_str!("../../federation/testdata/sample-session-snapshot.json");
+        let snap = RemoteSnapshot::from_api_response(body).expect("sample fixture parses");
+        let origin = Origin::new(
+            OriginKey::new("mini1").expect("valid origin key"),
+            "mini1",
+            ConnectionTarget::LocalSocket(std::path::PathBuf::from("/tmp/fed-test.sock")),
+        );
+        let rows = crate::federation::foreign_rows(&origin, &snap);
+        let foreign_ws_id = rows.workspaces.first().unwrap().id.clone();
+        let foreign_terminal_id = rows.terminals.first().unwrap().0.clone();
+        let foreign_pane_id = rows
+            .workspaces
+            .first()
+            .unwrap()
+            .tabs
+            .first()
+            .unwrap()
+            .root_pane;
+
+        let mut config = Config::default();
+        config.experimental.federation = true;
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(&config, true, None, api_rx, crate::api::EventHub::default());
+        app.federation_origins = vec![origin];
+        app.state.apply_foreign_rows(rows);
+        let ws_idx = app
+            .state
+            .workspaces
+            .iter()
+            .position(|ws| ws.id == foreign_ws_id)
+            .unwrap();
+        let public_pane_id = app.public_pane_id(ws_idx, foreign_pane_id).unwrap();
+        (app, public_pane_id, foreign_terminal_id)
+    }
+
+    fn default_read_params(pane_id: String) -> PaneReadParams {
+        PaneReadParams {
+            pane_id,
+            source: crate::api::schema::ReadSource::Visible,
+            format: crate::api::schema::ReadFormat::Text,
+            lines: None,
+            strip_ansi: true,
+            intent: crate::api::schema::ReadIntent::Interactive,
+        }
+    }
+
+    #[test]
+    fn pane_read_foreign_reads_from_frame_buffer() {
+        use crate::protocol::FrameData;
+        let (mut app, public_pane_id, terminal_id) = app_with_foreign_workspace();
+
+        let frame = FrameData {
+            cells: vec![
+                test_cell("h"),
+                test_cell("e"),
+                test_cell("l"),
+                test_cell("l"),
+                test_cell("o"),
+                test_cell(" "),
+                test_cell("w"),
+                test_cell("o"),
+                test_cell("r"),
+                test_cell("l"),
+                test_cell("d"),
+                test_cell("!"),
+            ],
+            width: 12,
+            height: 1,
+            cursor: None,
+            hyperlinks: Vec::new(),
+            graphics: Vec::new(),
+        };
+        app.state.foreign_frames.insert(terminal_id, frame);
+
+        let response = app.handle_pane_read("req".into(), default_read_params(public_pane_id));
+        let resp: SuccessResponse = serde_json::from_str(&response).unwrap();
+        match &resp.result {
+            ResponseResult::PaneRead { read } => {
+                assert_eq!(read.text, "hello world!");
+                assert!(!read.truncated);
+            }
+            other => panic!("expected PaneRead, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pane_read_foreign_empty_frame_returns_empty_text() {
+        let (mut app, public_pane_id, _terminal_id) = app_with_foreign_workspace();
+
+        let response = app.handle_pane_read("req".into(), default_read_params(public_pane_id));
+        let resp: SuccessResponse = serde_json::from_str(&response).unwrap();
+        match &resp.result {
+            ResponseResult::PaneRead { read } => {
+                assert_eq!(read.text, "");
+            }
+            other => panic!("expected PaneRead, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn pane_send_text_foreign_does_not_error() {
+        let (mut app, public_pane_id, _terminal_id) = app_with_foreign_workspace();
+
+        let response = app.handle_pane_send_text(
+            "req".into(),
+            PaneSendTextParams {
+                pane_id: public_pane_id,
+                text: "echo hello\n".to_string(),
+            },
+        );
+        let resp: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert!(matches!(resp.result, ResponseResult::Ok {}));
     }
 }

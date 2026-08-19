@@ -191,12 +191,15 @@ pub struct App {
     /// Dropping a handle aborts the observer.
     pub(crate) foreign_observers:
         HashMap<crate::terminal::TerminalId, crate::federation::ForeignObserveHandle>,
-    /// Delta-aware registry of federated origins (N4). Reconciled on every
-    /// discovery pass; provides add/update/remove semantics so removed origins
-    /// can be cleaned up proactively rather than waiting for the next rows tick.
+    /// Running foreign controller task handles, keyed by namespaced terminal id.
+    /// Dropping a handle aborts the controller.
+    pub(crate) foreign_control_handles:
+        HashMap<crate::terminal::TerminalId, crate::federation::ForeignControlHandle>,
+    /// Registry tracking which federation origins are known and which have
+    /// changed since the last reconciliation pass.
     pub(crate) federation_registry: crate::federation::FederationRegistry,
     /// Origins discovered by the federation poll task, stored here so
-    /// `reconcile_foreign_observers` can look up API sockets without
+    /// `reconcile_foreign_connections` can look up API sockets without
     /// re-discovering.
     pub(crate) federation_origins: Vec<crate::federation::Origin>,
     /// Handle to the running federation snapshot poll task, present only while
@@ -875,6 +878,7 @@ impl App {
             foreign_frame_tx,
             foreign_frame_rx,
             foreign_observers: HashMap::new(),
+            foreign_control_handles: HashMap::new(),
             federation_registry: crate::federation::FederationRegistry::new(),
             federation_origins: Vec::new(),
             federation_poll: None,
@@ -1050,7 +1054,7 @@ impl App {
             }
 
             // Send the discovered origins to the run loop once so
-            // reconcile_foreign_observers can look up API sockets.
+            // reconcile_foreign_connections can look up API sockets.
             if tx
                 .send(crate::federation::ForeignRowsMessage::OriginsDiscovered(
                     origins.clone(),
@@ -1120,7 +1124,7 @@ impl App {
     /// Reconcile foreign observer tasks against the current set of foreign
     /// terminals. Spawns observers for newly Attachable terminals, drops
     /// handles for removed terminals, and evicts stale frames.
-    pub(crate) fn reconcile_foreign_observers(&mut self) {
+    pub(crate) fn reconcile_foreign_connections(&mut self) {
         if !self.state.federation_enabled || self.federation_origins.is_empty() {
             return;
         }
@@ -1190,6 +1194,65 @@ impl App {
             self.foreign_observers.insert(terminal_id.clone(), handle);
         }
 
+        // Drop control handles for terminals that are no longer attachable.
+        self.foreign_control_handles
+            .retain(|terminal_id, _| attachable.contains(terminal_id));
+
+        // Spawn control handles for newly attachable terminals without one.
+        for terminal_id in &attachable {
+            if self.foreign_control_handles.contains_key(terminal_id) {
+                continue;
+            }
+            let Some((origin_key, raw_terminal_id)) =
+                crate::federation::parse_foreign_terminal_id(terminal_id)
+            else {
+                continue;
+            };
+            let Some(origin) = self.federation_origins.iter().find(|o| o.key == origin_key) else {
+                continue;
+            };
+            let api_socket_path = match &origin.target {
+                crate::federation::ConnectionTarget::LocalSocket(path) => path.clone(),
+            };
+            let client_socket_path =
+                crate::server::socket_paths::derive_client_socket_from_api_socket(&api_socket_path);
+
+            // Use the view's pane area size if available, else 80x24.
+            let (cols, rows) = self
+                .state
+                .view
+                .pane_infos
+                .first()
+                .map(|info| (info.inner_rect.width, info.inner_rect.height))
+                .unwrap_or((80, 24));
+
+            tracing::info!(
+                terminal_id = %terminal_id,
+                origin = %origin_key,
+                "spawning foreign controller"
+            );
+
+            let handle = crate::federation::spawn_foreign_controller(
+                client_socket_path,
+                raw_terminal_id,
+                terminal_id.clone(),
+                cols,
+                rows,
+            );
+
+            // Register the sender in the static map so input routing can find it.
+            crate::app::input::register_control_sender(
+                terminal_id.as_str().to_string(),
+                handle.tx.clone(),
+            );
+
+            self.foreign_control_handles
+                .insert(terminal_id.clone(), handle);
+        }
+
+        // Unregister control senders for terminals that are no longer attachable.
+        crate::app::input::unregister_control_senders_not_in(&attachable);
+
         // Evict frames for terminals that are no longer foreign or attachable.
         self.state
             .foreign_frames
@@ -1201,6 +1264,11 @@ impl App {
     fn drop_observers_for_removed_origins(&mut self, removed: &[crate::federation::OriginKey]) {
         for origin_key in removed {
             self.foreign_observers.retain(|terminal_id, _| {
+                crate::federation::parse_foreign_terminal_id(terminal_id)
+                    .map(|(key, _)| key != *origin_key)
+                    .unwrap_or(true)
+            });
+            self.foreign_control_handles.retain(|terminal_id, _| {
                 crate::federation::parse_foreign_terminal_id(terminal_id)
                     .map(|(key, _)| key != *origin_key)
                     .unwrap_or(true)
@@ -1500,7 +1568,7 @@ impl App {
                     // federation is enabled and clears it (ignoring `rows`) when
                     // it is not, so a tick that races a disable is a safe no-op.
                     self.state.apply_foreign_rows(rows);
-                    self.reconcile_foreign_observers();
+                    self.reconcile_foreign_connections();
                     needs_render = true;
                 }
                 LoopEvent::ForeignFrame(frame) => {
@@ -7070,7 +7138,7 @@ last_pane = "prefix+tab"
         app.federation_origins = vec![origin];
         app.state.federation_enabled = false;
 
-        app.reconcile_foreign_observers();
+        app.reconcile_foreign_connections();
 
         assert!(
             app.foreign_observers.is_empty(),
@@ -7091,7 +7159,7 @@ last_pane = "prefix+tab"
         app.federation_origins = Vec::new();
         app.state.federation_enabled = true;
 
-        app.reconcile_foreign_observers();
+        app.reconcile_foreign_connections();
 
         assert!(
             app.foreign_observers.is_empty(),
@@ -7112,7 +7180,7 @@ last_pane = "prefix+tab"
         app.federation_origins = vec![origin];
         app.state.federation_enabled = true;
 
-        app.reconcile_foreign_observers();
+        app.reconcile_foreign_connections();
 
         assert!(
             app.foreign_observers.is_empty(),
@@ -7128,7 +7196,7 @@ last_pane = "prefix+tab"
         app.federation_origins = vec![origin];
         app.state.federation_enabled = true;
 
-        app.reconcile_foreign_observers();
+        app.reconcile_foreign_connections();
 
         assert!(
             app.foreign_observers.is_empty(),
@@ -7149,7 +7217,7 @@ last_pane = "prefix+tab"
         app.federation_origins = vec![origin];
         app.state.federation_enabled = true;
 
-        app.reconcile_foreign_observers();
+        app.reconcile_foreign_connections();
 
         assert_eq!(app.foreign_observers.len(), 1);
         assert!(app.foreign_observers.contains_key(&terminal_id));
@@ -7168,8 +7236,8 @@ last_pane = "prefix+tab"
         app.federation_origins = vec![origin];
         app.state.federation_enabled = true;
 
-        app.reconcile_foreign_observers();
-        app.reconcile_foreign_observers();
+        app.reconcile_foreign_connections();
+        app.reconcile_foreign_connections();
 
         assert_eq!(app.foreign_observers.len(), 1);
         assert!(app.foreign_observers.contains_key(&terminal_id));
@@ -7187,7 +7255,7 @@ last_pane = "prefix+tab"
         );
         app.federation_origins = vec![origin];
         app.state.federation_enabled = true;
-        app.reconcile_foreign_observers();
+        app.reconcile_foreign_connections();
         assert_eq!(app.foreign_observers.len(), 1, "observer spawned first");
 
         app.state
@@ -7195,7 +7263,7 @@ last_pane = "prefix+tab"
             .get_mut(&terminal_id)
             .expect("foreign terminal present")
             .foreign_remote_protocol = Some(crate::protocol::PROTOCOL_VERSION - 1);
-        app.reconcile_foreign_observers();
+        app.reconcile_foreign_connections();
 
         assert!(
             app.foreign_observers.is_empty(),
@@ -7219,11 +7287,136 @@ last_pane = "prefix+tab"
             .foreign_frames
             .insert(terminal_id.clone(), empty_test_frame());
 
-        app.reconcile_foreign_observers();
+        app.reconcile_foreign_connections();
 
         assert!(
             app.state.foreign_frames.is_empty(),
             "cached frames for a non-attachable terminal must be evicted"
         );
+    }
+
+    #[tokio::test]
+    async fn attachable_foreign_terminal_gets_observer_and_control() {
+        let mut app = test_app();
+        let origin = federation_test_origin("nTEST");
+        let terminal_id = insert_foreign_terminal(
+            &mut app,
+            &origin.key,
+            "term_1",
+            Some(crate::protocol::PROTOCOL_VERSION),
+        );
+        app.federation_origins = vec![origin];
+        app.state.federation_enabled = true;
+
+        app.reconcile_foreign_connections();
+
+        assert!(
+            app.foreign_observers.contains_key(&terminal_id),
+            "attachable terminal must have an observer spawned"
+        );
+        assert!(
+            app.foreign_control_handles.contains_key(&terminal_id),
+            "attachable terminal must have a control handle spawned"
+        );
+    }
+
+    #[tokio::test]
+    async fn frames_survive_reconcile_for_attachable_terminals() {
+        let mut app = test_app();
+        let origin = federation_test_origin("nTEST");
+        let terminal_id = insert_foreign_terminal(
+            &mut app,
+            &origin.key,
+            "term_1",
+            Some(crate::protocol::PROTOCOL_VERSION),
+        );
+        app.federation_origins = vec![origin];
+        app.state.federation_enabled = true;
+
+        // Simulate a frame arriving from the observer.
+        app.state
+            .foreign_frames
+            .insert(terminal_id.clone(), empty_test_frame());
+
+        app.reconcile_foreign_connections();
+
+        assert!(
+            app.state.foreign_frames.contains_key(&terminal_id),
+            "frames for attachable terminals must survive reconcile"
+        );
+    }
+
+    #[tokio::test]
+    async fn frames_evicted_when_terminal_becomes_non_attachable() {
+        let mut app = test_app();
+        let origin = federation_test_origin("nTEST");
+        let terminal_id = insert_foreign_terminal(
+            &mut app,
+            &origin.key,
+            "term_1",
+            Some(crate::protocol::PROTOCOL_VERSION),
+        );
+        app.federation_origins = vec![origin];
+        app.state.federation_enabled = true;
+
+        // Frame arrives while attachable.
+        app.state
+            .foreign_frames
+            .insert(terminal_id.clone(), empty_test_frame());
+        assert!(app.state.foreign_frames.contains_key(&terminal_id));
+
+        // Terminal becomes non-attachable (protocol mismatch).
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .foreign_remote_protocol = Some(crate::protocol::PROTOCOL_VERSION - 1);
+
+        app.reconcile_foreign_connections();
+
+        assert!(
+            !app.state.foreign_frames.contains_key(&terminal_id),
+            "frames for non-attachable terminals must be evicted"
+        );
+        assert!(
+            !app.foreign_observers.contains_key(&terminal_id),
+            "observers for non-attachable terminals must be dropped"
+        );
+        assert!(
+            !app.foreign_control_handles.contains_key(&terminal_id),
+            "control handles for non-attachable terminals must be dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn foreign_frame_storage_and_retrieval() {
+        let mut app = test_app();
+        let origin = federation_test_origin("nTEST");
+        let terminal_id = insert_foreign_terminal(
+            &mut app,
+            &origin.key,
+            "term_1",
+            Some(crate::protocol::PROTOCOL_VERSION),
+        );
+        app.federation_origins = vec![origin];
+        app.state.federation_enabled = true;
+
+        // Build a frame with known content.
+        let area = ratatui::layout::Rect::new(0, 0, 2, 1);
+        let mut buffer = ratatui::buffer::Buffer::filled(area, ratatui::buffer::Cell::new(" "));
+        buffer.cell_mut((0, 0)).unwrap().set_symbol("X");
+        buffer.cell_mut((1, 0)).unwrap().set_symbol("Y");
+        let frame = crate::protocol::FrameData::from_ratatui_buffer(&buffer, None);
+
+        // Insert the frame.
+        app.state.foreign_frames.insert(terminal_id.clone(), frame);
+
+        // Retrieve and verify the frame renders correctly.
+        let retrieved = app.state.foreign_frames.get(&terminal_id).unwrap();
+        let restored_buffer = retrieved
+            .to_ratatui_buffer()
+            .expect("frame converts to buffer");
+        assert_eq!(restored_buffer.cell((0, 0)).unwrap().symbol(), "X");
+        assert_eq!(restored_buffer.cell((1, 0)).unwrap().symbol(), "Y");
     }
 }

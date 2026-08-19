@@ -59,6 +59,7 @@ pub(crate) use self::{
         terminal_direct_indexed_navigation_action, terminal_direct_non_indexed_navigation_action,
     },
     settings::open_settings_at,
+    terminal::{register_control_sender, unregister_control_senders_not_in},
 };
 use self::{
     modal::{

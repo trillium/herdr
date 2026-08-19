@@ -131,6 +131,13 @@ impl App {
             return Some((ws_idx, pane_id));
         }
 
+        // Terminal-id lookup: stable across hub poll renumbering cycles. Try this
+        // before the legacy dash-split path so "fed~key~term_xxxx" resolves
+        // correctly instead of being mangled by rsplit_once('-').
+        if let Some(result) = self.find_pane_by_terminal_id_str(id) {
+            return Some(result);
+        }
+
         let (ws_raw, pane_number_raw) = id.rsplit_once('-')?;
         let ws_idx = self.parse_workspace_id(ws_raw)?;
         let pane_number = pane_number_raw.parse::<usize>().ok()?;
@@ -140,6 +147,23 @@ impl App {
             .iter()
             .find_map(|(pane_id, number)| (*number == pane_number).then_some(*pane_id))?;
         Some((ws_idx, pane_id))
+    }
+
+    /// Find a pane by its terminal id string. Used to resolve foreign pane ids
+    /// expressed as namespaced terminal ids, which are stable across hub poll
+    /// renumbering cycles unlike hub-assigned pane numbers.
+    fn find_pane_by_terminal_id_str(
+        &self,
+        id: &str,
+    ) -> Option<(usize, crate::layout::PaneId)> {
+        let target = crate::terminal::TerminalId::from_string(id);
+        self.state.workspaces.iter().enumerate().find_map(|(ws_idx, ws)| {
+            ws.tabs.iter().find_map(|tab| {
+                tab.panes.iter().find_map(|(pane_id, pane_state)| {
+                    (pane_state.attached_terminal_id == target).then_some((ws_idx, *pane_id))
+                })
+            })
+        })
     }
 
     pub(crate) fn parse_current_public_pane_id(

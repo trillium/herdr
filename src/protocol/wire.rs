@@ -2266,4 +2266,73 @@ mod tests {
             Ok(to_read)
         }
     }
+
+    // ---- FrameData roundtrip ----
+
+    #[test]
+    fn foreign_frame_data_roundtrip_preserves_cell_attributes() {
+        // Build a small 3×2 buffer with distinct cells.
+        let area = ratatui::layout::Rect::new(0, 0, 3, 2);
+        let mut buffer = ratatui::buffer::Buffer::filled(area, ratatui::buffer::Cell::new(" "));
+
+        // Cell (0,0): "A" with red fg
+        let cell = buffer.cell_mut((0, 0)).unwrap();
+        cell.set_symbol("A");
+        cell.fg = Color::Red;
+
+        // Cell (1,0): "B" with blue bg
+        let cell = buffer.cell_mut((1, 0)).unwrap();
+        cell.set_symbol("B");
+        cell.bg = Color::Blue;
+
+        // Cell (0,1): "C" with bold modifier
+        let cell = buffer.cell_mut((0, 1)).unwrap();
+        cell.set_symbol("C");
+        cell.modifier = Modifier::BOLD;
+
+        // Convert to FrameData and back.
+        let frame = FrameData::from_ratatui_buffer(&buffer, None);
+        assert_eq!(frame.width, 3);
+        assert_eq!(frame.height, 2);
+        assert_eq!(frame.cells.len(), 6);
+
+        let restored = frame
+            .to_ratatui_buffer()
+            .expect("roundtrip produces buffer");
+        assert_eq!(restored.area, area);
+
+        // Verify cell content survived the roundtrip.
+        assert_eq!(restored.cell((0, 0)).unwrap().symbol(), "A");
+        assert_eq!(restored.cell((0, 0)).unwrap().fg, Color::Red);
+        assert_eq!(restored.cell((1, 0)).unwrap().symbol(), "B");
+        assert_eq!(restored.cell((1, 0)).unwrap().bg, Color::Blue);
+        assert_eq!(restored.cell((0, 1)).unwrap().symbol(), "C");
+        assert_eq!(restored.cell((0, 1)).unwrap().modifier, Modifier::BOLD);
+    }
+
+    #[test]
+    fn frame_data_to_ratatui_buffer_returns_none_on_size_mismatch() {
+        let frame = FrameData {
+            cells: vec![
+                CellData {
+                    symbol: " ".to_owned(),
+                    fg: 0,
+                    bg: 0,
+                    modifier: 0,
+                    skip: false,
+                    hyperlink: None,
+                };
+                4
+            ], // only 4 cells
+            width: 3,
+            height: 2, // expects 6 cells
+            cursor: None,
+            hyperlinks: Vec::new(),
+            graphics: Vec::new(),
+        };
+        assert!(
+            frame.to_ratatui_buffer().is_none(),
+            "mismatched cell count must return None"
+        );
+    }
 }

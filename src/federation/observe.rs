@@ -258,6 +258,7 @@ impl std::fmt::Display for ObserveSessionError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use interprocess::local_socket::traits::Listener as _;
 
     #[test]
     fn observe_session_error_display_variants() {
@@ -290,5 +291,165 @@ mod tests {
             unexpected.to_string().contains("unexpected message"),
             "{unexpected}"
         );
+    }
+
+    /// Start a mock server that speaks the observe protocol:
+    /// 1. Reads Hello, validates version
+    /// 2. Sends Welcome
+    /// 3. Reads ObserveTerminal
+    /// 4. Sends N frames, then closes
+    fn start_mock_observe_server(
+        socket_path: &std::path::Path,
+        frames: Vec<FrameData>,
+    ) -> std::thread::JoinHandle<()> {
+        use crate::protocol::{read_message, write_message};
+        use interprocess::local_socket::traits::Listener as _;
+
+        let socket_path = socket_path.to_path_buf();
+        std::thread::spawn(move || {
+            let listener =
+                crate::ipc::bind_local_listener(&socket_path).expect("mock server: bind listener");
+            let mut stream = listener.accept().expect("mock server: accept");
+
+            // Read Hello
+            let hello: ClientMessage = read_message(&mut stream, crate::protocol::MAX_FRAME_SIZE)
+                .expect("mock server: read Hello");
+            match hello {
+                ClientMessage::Hello { version, .. } => {
+                    assert_eq!(
+                        version, PROTOCOL_VERSION,
+                        "mock server: protocol version mismatch"
+                    );
+                }
+                other => panic!("mock server: expected Hello, got {other:?}"),
+            }
+
+            // Send Welcome
+            write_message(
+                &mut stream,
+                &ServerMessage::Welcome {
+                    version: PROTOCOL_VERSION,
+                    encoding: crate::protocol::RenderEncoding::SemanticFrame,
+                    error: None,
+                },
+            )
+            .expect("mock server: send Welcome");
+
+            // Read ObserveTerminal
+            let observe: ClientMessage = read_message(&mut stream, crate::protocol::MAX_FRAME_SIZE)
+                .expect("mock server: read ObserveTerminal");
+            match observe {
+                ClientMessage::ObserveTerminal { target } => {
+                    assert_eq!(target, "term_1", "mock server: unexpected target");
+                }
+                other => panic!("mock server: expected ObserveTerminal, got {other:?}"),
+            }
+
+            // Send frames
+            for frame in frames {
+                write_message(&mut stream, &ServerMessage::Frame(frame))
+                    .expect("mock server: send Frame");
+            }
+
+            // Connection closes when stream is dropped
+        })
+    }
+
+    #[test]
+    fn observer_receives_frames_from_mock_server() {
+        let dir = std::env::temp_dir().join(format!("herdr-observe-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create test dir");
+        let socket_path = dir.join("mock-observe.sock");
+
+        // Build a frame with known content.
+        let area = ratatui::layout::Rect::new(0, 0, 3, 2);
+        let mut buffer = ratatui::buffer::Buffer::filled(area, ratatui::buffer::Cell::new(" "));
+        buffer.cell_mut((0, 0)).unwrap().set_symbol("H");
+        buffer.cell_mut((1, 0)).unwrap().set_symbol("I");
+        let frame = FrameData::from_ratatui_buffer(&buffer, None);
+
+        // Start mock server that sends one frame.
+        let server = start_mock_observe_server(&socket_path, vec![frame]);
+
+        // Give the server time to start listening.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // Create a tokio channel to receive frames.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ForeignFrame>(16);
+
+        // Run the observer session directly (blocking).
+        let terminal_id = TerminalId::from_string("term_1");
+        let namespaced_id = TerminalId::from_string("fed~nTEST~term_1");
+        let result = run_observer_session(&socket_path, &terminal_id, &namespaced_id, 80, 24, tx);
+
+        // Verify the session completed without error.
+        result.expect("observer session must succeed");
+
+        // Verify we received the frame.
+        let received = rx.try_recv().expect("must receive one frame");
+        assert_eq!(received.terminal_id, namespaced_id);
+        assert_eq!(received.frame.width, 3);
+        assert_eq!(received.frame.height, 2);
+
+        // Verify the frame content survived the roundtrip.
+        let restored = received
+            .frame
+            .to_ratatui_buffer()
+            .expect("frame converts to buffer");
+        assert_eq!(restored.cell((0, 0)).unwrap().symbol(), "H");
+        assert_eq!(restored.cell((1, 0)).unwrap().symbol(), "I");
+
+        // Clean up.
+        server.join().expect("mock server thread must not panic");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn observer_handles_server_rejection() {
+        use crate::protocol::write_message;
+
+        let dir = std::env::temp_dir().join(format!("herdr-observe-reject-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create test dir");
+        let socket_path = dir.join("mock-reject.sock");
+
+        let socket_path_clone = socket_path.clone();
+        let server = std::thread::spawn(move || {
+            let listener =
+                crate::ipc::bind_local_listener(&socket_path_clone).expect("bind listener");
+            let mut stream = listener.accept().expect("accept");
+
+            // Read Hello
+            let _hello: ClientMessage =
+                crate::protocol::read_message(&mut stream, crate::protocol::MAX_FRAME_SIZE)
+                    .expect("read Hello");
+
+            // Send rejection
+            write_message(
+                &mut stream,
+                &ServerMessage::Welcome {
+                    version: PROTOCOL_VERSION,
+                    encoding: crate::protocol::RenderEncoding::SemanticFrame,
+                    error: Some("test rejection".to_string()),
+                },
+            )
+            .expect("send rejection");
+        });
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let (tx, _rx) = tokio::sync::mpsc::channel::<ForeignFrame>(16);
+        let terminal_id = TerminalId::from_string("term_1");
+        let namespaced_id = TerminalId::from_string("fed~nTEST~term_1");
+        let result = run_observer_session(&socket_path, &terminal_id, &namespaced_id, 80, 24, tx);
+
+        match result {
+            Err(ObserveSessionError::Rejected(msg)) => {
+                assert!(msg.contains("test rejection"), "rejection message: {msg}");
+            }
+            other => panic!("expected Rejected error, got {other:?}"),
+        }
+
+        server.join().expect("server thread must not panic");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

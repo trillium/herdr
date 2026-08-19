@@ -98,6 +98,30 @@ pub fn send_action_to_foreign(
     Ok(())
 }
 
+/// Send a structure action to a remote origin and return its full response value.
+///
+/// Unlike [`send_action_to_foreign`] this surfaces the remote's JSON response
+/// body so callers can extract result fields (e.g. the new pane id from a
+/// `pane.split`). Synchronous and blocking — run from an async context via
+/// `tokio::task::block_in_place` or `tokio::task::spawn_blocking`.
+pub fn call_action_on_foreign_with_response(
+    origin: &Origin,
+    method: &Method,
+    timeout: Duration,
+) -> Result<serde_json::Value, RelayError> {
+    let target = match &origin.target {
+        ConnectionTarget::LocalSocket(path) => ApiConnectionTarget::SocketPath(path.clone()),
+    };
+    let client = ApiClient::for_target(target);
+    let request = Request {
+        id: format!("federation:action-resp:{}", origin.key),
+        method: method.clone(),
+    };
+    client
+        .request_value_with_timeout(&request, timeout)
+        .map_err(RelayError::Api)
+}
+
 /// Spawn a background task that discovers the origin matching `origin_key` and
 /// sends `method` to it, fire-and-forget. The response and any error are
 /// logged, never surfaced to the caller — matching the N1d input-relay posture
