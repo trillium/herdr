@@ -96,8 +96,9 @@ fn federation_protocol_gating_with_remote_attach() {
         .expect("remote pane id");
 
     // Send a marker so we can verify snapshot delivery.
+    // pane run joins args after pane_id as text and appends Enter; no --text flag needed.
     ssh.remote_command(&format!(
-        "herdr --session {SESSION_NAME} pane send-text {remote_pane_id} --text 'printf {MARKER}\\n'"
+        "herdr --session {SESSION_NAME} pane run {remote_pane_id} printf '{MARKER}\\n'"
     ));
     // Give the remote PTY time to process the marker.
     thread::sleep(Duration::from_millis(500));
@@ -231,8 +232,10 @@ fn federation_protocol_gating_with_remote_attach() {
         Duration::from_secs(20),
     );
     // Verify the input also reached the remote.
+    // wait_for_pane_text already confirmed the hub sees INPUT_MARKER via the observer frame;
+    // the remote visible screen has the output -- use --source visible, not recent (scrollback).
     let remote_after_input = ssh.remote_command(&format!(
-        "herdr --session {SESSION_NAME} pane read {remote_pane_id} --source recent --lines 20"
+        "herdr --session {SESSION_NAME} pane read {remote_pane_id} --source visible --lines 40"
     ));
     assert!(
         remote_after_input.contains(INPUT_MARKER),
