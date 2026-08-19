@@ -11,6 +11,30 @@ use super::{
 
 pub const MAX_TOAST_DELAY_SECONDS: u64 = 3600;
 
+fn default_true() -> bool {
+    true
+}
+
+/// Display overrides for a single federated origin.
+#[derive(Debug, Default, Deserialize, Clone)]
+#[serde(default)]
+pub struct FederationOriginConfig {
+    /// Custom sidebar label prefix. Overrides the auto-truncated hostname.
+    /// Example: `label = "work"` turns `"mini1:parlay-dev"` into `"work:parlay-dev"`.
+    pub label: Option<String>,
+    /// Sidebar coloration for this origin. Palette color names: "teal", "blue",
+    /// "green", "red", "yellow", "mauve", "peach". Default: "teal".
+    pub color: Option<String>,
+}
+
+/// Per-origin display configuration for fleet federation.
+#[derive(Debug, Default, Deserialize, Clone)]
+#[serde(default)]
+pub struct FederationConfig {
+    /// Per-origin overrides, keyed by the origin's hostname label (e.g. `"mini1"`).
+    pub origins: std::collections::HashMap<String, FederationOriginConfig>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum UpdateChannelConfig {
@@ -322,6 +346,7 @@ pub struct Config {
     pub advanced: AdvancedConfig,
     pub experimental: ExperimentalConfig,
     pub remote: RemoteConfig,
+    pub federation: FederationConfig,
 }
 
 #[derive(Debug)]
@@ -1015,6 +1040,11 @@ pub struct ExperimentalConfig {
     /// immediately; enabling takes effect at the next launch. Default: false.
     /// See `src/federation/`.
     pub federation: bool,
+    /// Tint foreign workspaces in the sidebar with a distinct color so remote
+    /// origins are visually distinguishable from local workspaces. Default: true.
+    /// Disable with `federation_coloration = false` under `[experimental]`.
+    #[serde(default = "default_true")]
+    pub federation_coloration: bool,
     /// Directory to look for forwarded federation API sockets from remote herdr
     /// servers (e.g. via SSH socket forwarding). When set, used as the primary
     /// source for `forwarded_socket_path()` before `HERDR_FEDERATION_SOCKET_DIR`

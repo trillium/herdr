@@ -20,6 +20,34 @@ use crate::terminal::TerminalRuntimeRegistry;
 const WORKSPACE_SECTION_HEADER_ROWS: u16 = 2;
 const AGENT_PANEL_HEADER_ROWS: u16 = 3;
 
+/// Resolve the configured color for a foreign workspace. Looks up the origin
+/// key from the workspace id, finds the color name in `AppState`, and maps it
+/// to the active palette. Falls back to `p.teal` for unknown names or missing
+/// config.
+fn foreign_ws_color(ws_id: &str, app: &AppState, p: &Palette) -> ratatui::style::Color {
+    let color_name = crate::federation::parse_foreign_workspace_id(ws_id)
+        .and_then(|(key, _)| app.federation_origin_color_names.get(&key))
+        .map(|s| s.as_str())
+        .unwrap_or("teal");
+    palette_color_by_name(color_name, p)
+}
+
+/// Map a palette color name to the active `Palette` color. Unknown names fall
+/// back to `p.teal`. Accepted names match the `Palette` field names.
+fn palette_color_by_name(name: &str, p: &Palette) -> ratatui::style::Color {
+    match name {
+        "teal" => p.teal,
+        "blue" => p.blue,
+        "green" => p.green,
+        "red" => p.red,
+        "yellow" => p.yellow,
+        "mauve" => p.mauve,
+        "peach" => p.peach,
+        "accent" => p.accent,
+        _ => p.teal,
+    }
+}
+
 pub(crate) struct AgentPanelEntry {
     pub ws_idx: usize,
     pub tab_idx: usize,
@@ -1268,13 +1296,17 @@ fn render_workspace_list(
         let is_foreign_ws =
             app.federation_enabled && crate::federation::is_foreign_workspace_id(&ws.id);
         let name_style = if selected || is_active || is_dragged {
-            if is_foreign_ws {
-                Style::default().fg(p.teal).add_modifier(Modifier::BOLD)
+            if is_foreign_ws && app.federation_coloration {
+                Style::default()
+                    .fg(foreign_ws_color(&ws.id, app, p))
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(p.text).add_modifier(Modifier::BOLD)
             }
-        } else if is_foreign_ws {
-            Style::default().fg(p.teal).add_modifier(Modifier::DIM)
+        } else if is_foreign_ws && app.federation_coloration {
+            Style::default()
+                .fg(foreign_ws_color(&ws.id, app, p))
+                .add_modifier(Modifier::DIM)
         } else {
             Style::default().fg(p.subtext0)
         };

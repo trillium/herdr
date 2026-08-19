@@ -209,6 +209,9 @@ pub struct App {
     /// Resolved `federation_socket_dir` from the config, passed to
     /// [`crate::federation::discover_origins`] at each discovery call.
     pub(crate) federation_socket_dir: Option<std::path::PathBuf>,
+    /// Per-origin display config from `[federation.origins]`. Used to apply
+    /// label and color overrides when origins are discovered or config reloads.
+    pub(crate) federation_config: crate::config::FederationConfig,
 }
 
 /// Lifecycle handle for the background federation snapshot poll task.
@@ -737,6 +740,8 @@ impl App {
                 .switch_ascii_input_source_in_prefix,
             kitty_graphics_enabled: config.experimental.kitty_graphics,
             federation_enabled: config.experimental.federation,
+            federation_coloration: config.experimental.federation_coloration,
+            federation_origin_color_names: std::collections::HashMap::new(),
             foreign_frames: std::collections::HashMap::new(),
             default_shell: config.terminal.default_shell.clone(),
             shell_mode: config.terminal.shell_mode,
@@ -887,6 +892,7 @@ impl App {
                 .federation_socket_dir
                 .as_deref()
                 .map(crate::worktree::expand_tilde_path),
+            federation_config: config.federation.clone(),
         };
         app.configure_tab_bar_status(&config.ui.tab_bar_right, &config.ui.tab_bar_right_separator);
         app.configure_window_title(&config.ui.window_title);
@@ -1032,6 +1038,14 @@ impl App {
         let task_shutdown = shutdown.clone();
         let tx = self.foreign_rows_tx.clone();
         let config_socket_dir = self.federation_socket_dir.clone();
+        // Capture label overrides so the poll task can rewrite origin.label for
+        // ingest labeling without holding a reference to the live config.
+        let label_overrides: std::collections::HashMap<String, String> = self
+            .federation_config
+            .origins
+            .iter()
+            .filter_map(|(k, v)| v.label.as_ref().map(|l| (k.clone(), l.clone())))
+            .collect();
         let task = tokio::spawn(async move {
             // Discover origins once at task start (subprocess: off the reactor).
             let origins = match tokio::task::spawn_blocking(move || {
@@ -1065,10 +1079,23 @@ impl App {
                 return;
             }
 
+            // Apply per-origin label overrides for workspace label generation.
+            // The OriginsDiscovered message above uses original labels so the
+            // run loop can still look them up in federation_config by hostname.
+            let poll_origins_base: Vec<_> = origins
+                .into_iter()
+                .map(|mut o| {
+                    if let Some(label) = label_overrides.get(&o.label) {
+                        o.label = label.clone();
+                    }
+                    o
+                })
+                .collect();
+
             loop {
                 // Fetch every origin's snapshot on a blocking thread (ApiClient is
                 // synchronous), then hand the combined rows to the run loop.
-                let poll_origins = origins.clone();
+                let poll_origins = poll_origins_base.clone();
                 match tokio::task::spawn_blocking(move || {
                     crate::federation::collect_foreign_rows(
                         &poll_origins,
@@ -1118,6 +1145,25 @@ impl App {
     pub(crate) fn start_federation_poll_if_enabled(&mut self) {
         if self.state.federation_enabled {
             self.spawn_federation_poll();
+        }
+    }
+
+    /// Rebuild `AppState::federation_origin_color_names` from the current
+    /// `federation_origins` and `federation_config`. Called after origins are
+    /// discovered and after config reloads.
+    fn apply_federation_origin_colors(&mut self) {
+        self.state.federation_origin_color_names.clear();
+        for origin in &self.federation_origins {
+            let color = self
+                .federation_config
+                .origins
+                .get(&origin.label)
+                .and_then(|c| c.color.as_deref())
+                .unwrap_or("teal")
+                .to_string();
+            self.state
+                .federation_origin_color_names
+                .insert(origin.key.clone(), color);
         }
     }
 
@@ -1562,6 +1608,8 @@ impl App {
                     if !delta.removed.is_empty() {
                         self.drop_observers_for_removed_origins(&delta.removed);
                     }
+                    // Rebuild per-origin color names after origin set changes.
+                    self.apply_federation_origin_colors();
                 }
                 LoopEvent::ForeignRows(crate::federation::ForeignRowsMessage::Rows(rows)) => {
                     // The flag-gated seam replaces the foreign projection when
@@ -1933,6 +1981,9 @@ impl App {
             }
             let was_federation_enabled = self.state.federation_enabled;
             self.state.federation_enabled = config.experimental.federation;
+            self.state.federation_coloration = config.experimental.federation_coloration;
+            self.federation_config = config.federation.clone();
+            self.apply_federation_origin_colors();
             if was_federation_enabled && !config.experimental.federation {
                 // Toggled off at runtime: stop polling so a disabled runtime does
                 // no further federation network I/O, then drop any projected

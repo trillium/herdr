@@ -1461,6 +1461,14 @@ pub struct AppState {
     /// splice. The flag is consulted only by the gated seam
     /// [`AppState::apply_foreign_rows`]; the splice itself is unconditional.
     pub federation_enabled: bool,
+    /// Whether to tint foreign workspaces in the sidebar. Mirrors
+    /// `experimental.federation_coloration`; default true.
+    pub federation_coloration: bool,
+    /// Per-origin color name for sidebar tinting, keyed by `OriginKey`.
+    /// Resolved against the active palette at render time. Falls back to "teal"
+    /// when the key is absent. Populated when origins are discovered.
+    pub federation_origin_color_names:
+        std::collections::HashMap<crate::federation::OriginKey, String>,
     /// Cached live frames from remote observer connections (N3 live view).
     /// Keyed by the namespaced foreign terminal id (`fed~<key>~<raw>`).
     /// Updated by `LoopEvent::ForeignFrame`; rendered in place of the N2
@@ -1969,6 +1977,8 @@ impl AppState {
             switch_ascii_input_source_in_prefix: false,
             kitty_graphics_enabled: false,
             federation_enabled: false,
+            federation_coloration: true,
+            federation_origin_color_names: std::collections::HashMap::new(),
             foreign_frames: std::collections::HashMap::new(),
             default_shell: String::new(),
             shell_mode: crate::config::ShellModeConfig::Auto,
