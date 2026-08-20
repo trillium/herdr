@@ -1318,3 +1318,19 @@ fn popup_close_request_round_trips() {
     assert_eq!(json["method"], "popup.close");
     assert_eq!(json["params"], serde_json::json!({}));
 }
+
+#[test]
+fn federation_status_request_round_trips() {
+    let request = Request {
+        id: "federation-status".into(),
+        method: Method::FederationStatus(EmptyParams::default()),
+    };
+
+    let json = serde_json::to_value(&request).unwrap();
+
+    assert_eq!(json["method"], "federation.status");
+    assert_eq!(json["params"], serde_json::json!({}));
+
+    let restored: Request = serde_json::from_value(json).unwrap();
+    assert_eq!(restored, request);
+}
