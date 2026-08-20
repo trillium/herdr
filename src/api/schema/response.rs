@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use super::agents::AgentInfo;
 use super::common::{ClientWindowTitleReason, NotificationShowReason};
 use super::events::EventEnvelope;
+use super::federation::FederationStatusResponse;
 use super::integrations::{
     IntegrationInstallResult, IntegrationTarget, IntegrationUninstallResult,
 };
@@ -177,8 +178,6 @@ pub enum ResponseResult {
         file_frame_formats: Vec<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         file_frame_max_bytes: Option<usize>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        file_frame_direct_max_bytes: Option<usize>,
         /// Accepts damage metadata while still consuming a complete canonical file.
         #[serde(default)]
         file_frame_damage: bool,
@@ -267,6 +266,9 @@ pub enum ResponseResult {
     ConfigReload {
         status: crate::config::ConfigReloadStatus,
         diagnostics: Vec<String>,
+    },
+    FederationStatus {
+        status: Box<FederationStatusResponse>,
     },
     Ok {},
 }

@@ -242,6 +242,8 @@ pub enum Method {
     PluginPaneFocus(PluginPaneFocusParams),
     #[serde(rename = "plugin.pane.close")]
     PluginPaneClose(PluginPaneCloseParams),
+    #[serde(rename = "federation.status")]
+    FederationStatus(EmptyParams),
 }
 
 #[cfg(test)]

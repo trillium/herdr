@@ -15,7 +15,7 @@ pub enum OriginStatusKind {
 }
 
 /// Detailed status for a single origin.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct OriginStatusResponse {
     /// Stable origin key (Tailscale node ID or static name).
     pub key: String,
@@ -40,7 +40,7 @@ pub struct OriginStatusResponse {
 }
 
 /// Federation fleet status summary.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct FederationStatusResponse {
     /// Whether federation is enabled.
     pub enabled: bool,
