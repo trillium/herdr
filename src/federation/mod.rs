@@ -38,6 +38,7 @@ mod origin;
 mod poll;
 mod registry;
 pub mod relay;
+pub mod status;
 
 pub use control::{spawn_foreign_controller, ControlCommand, ForeignControlHandle};
 pub use discovery::{
@@ -54,6 +55,7 @@ pub use namespace::{
 pub use observe::{spawn_foreign_observer, ForeignFrame, ForeignObserveHandle};
 pub use origin::{ConnectionTarget, InvalidOriginKey, Origin, OriginKey};
 pub use poll::collect_foreign_rows;
+pub use status::{FederationStatusTracker, OriginStatus, OriginStatusDetail};
 pub use registry::{FederationRegistry, ReconcileDelta};
 
 /// Message sent from the federation poll task to the run loop on the
