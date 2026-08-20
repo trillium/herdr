@@ -15,6 +15,12 @@ use std::{
 
 mod clipboard_image;
 
+pub(crate) fn set_default_plugin_pane_pwd(
+    _env: &mut Vec<(String, String)>,
+    _cwd: &std::path::Path,
+) {
+}
+
 use windows_sys::{
     Wdk::System::Threading::{NtQueryInformationProcess, ProcessBasicInformation},
     Win32::{
@@ -362,6 +368,10 @@ pub(crate) fn should_draw_host_cursor_by_default() -> bool {
     true
 }
 
+pub(crate) fn should_query_host_terminal_palette() -> bool {
+    false
+}
+
 /// The machine's node name, as shown by tmux's `#h`.
 pub(crate) fn hostname() -> Option<String> {
     std::env::var("COMPUTERNAME")
@@ -687,13 +697,22 @@ fn resume_suspended_process(process_id: Option<u32>) -> std::io::Result<()> {
     result
 }
 
+impl StatusCommandGuard {
+    pub(crate) fn terminate(&mut self) {
+        if self.job != 0 {
+            // KILL_ON_JOB_CLOSE terminates the shell and every descendant still in
+            // the job, including on task cancellation and config reload.
+            unsafe {
+                CloseHandle(self.job as HANDLE);
+            }
+            self.job = 0;
+        }
+    }
+}
+
 impl Drop for StatusCommandGuard {
     fn drop(&mut self) {
-        // KILL_ON_JOB_CLOSE terminates the shell and every descendant still in
-        // the job, including on task cancellation and config reload.
-        unsafe {
-            CloseHandle(self.job as HANDLE);
-        }
+        self.terminate();
     }
 }
 
@@ -1876,7 +1895,7 @@ pub fn read_clipboard_text() -> Option<String> {
     None
 }
 
-pub fn open_url(url: &str) -> std::io::Result<()> {
+pub fn open_url(url: &str) -> std::io::Result<Option<std::process::Child>> {
     let operation = wide_null("open");
     let url = wide_null(url);
     let result = unsafe {
@@ -1890,7 +1909,7 @@ pub fn open_url(url: &str) -> std::io::Result<()> {
         )
     };
     if result as isize > 32 {
-        Ok(())
+        Ok(None)
     } else {
         Err(std::io::Error::other(format!(
             "failed to open URL with ShellExecuteW: code {}",
