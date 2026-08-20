@@ -21,6 +21,7 @@
 //! reactor.
 
 use std::fmt;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::api::client::{ApiClient, ApiClientError, ConnectionTarget as ApiConnectionTarget};
@@ -28,6 +29,7 @@ use crate::api::schema::{EmptyParams, Method, Request};
 
 use super::ingest::{foreign_rows, ForeignRows, IngestError, RemoteSnapshot};
 use super::origin::{ConnectionTarget, Origin};
+use super::status::FederationStatusTracker;
 
 /// Failure fetching or decoding a single origin's snapshot. Never surfaced to a
 /// caller — [`collect_foreign_rows`] logs it and skips the origin — but carried
@@ -71,6 +73,77 @@ impl std::error::Error for PollError {
 /// warned and skipped.
 pub fn collect_foreign_rows(origins: &[Origin], timeout: Duration) -> ForeignRows {
     collect_with_fetcher(origins, timeout, fetch_snapshot_body)
+}
+
+/// Fetch + map every origin's snapshot and track their status.
+///
+/// Like [`collect_foreign_rows`], but also updates the provided status tracker
+/// with per-origin success/failure status. Useful for fleet health monitoring.
+/// The tracker is behind an Arc<Mutex>, so it can be safely shared across threads.
+pub fn collect_foreign_rows_with_status(
+    origins: &[Origin],
+    timeout: Duration,
+    status_tracker: Arc<Mutex<FederationStatusTracker>>,
+) -> ForeignRows {
+    let mut combined = ForeignRows::empty();
+    for chunk in origins.chunks(8) {
+        // One scoped thread per origin in the chunk.
+        let results: Vec<std::thread::Result<Result<ForeignRows, PollError>>> =
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = chunk
+                    .iter()
+                    .map(|origin| {
+                        let tracker = Arc::clone(&status_tracker);
+                        scope.spawn(move || {
+                            let result = fetch_snapshot_body(origin, timeout)
+                                .and_then(|body| map_snapshot_body(origin, &body));
+
+                            // Update status tracker based on result
+                            match &result {
+                                Ok(_rows) => {
+                                    if let Ok(mut tracker) = tracker.lock() {
+                                        tracker.mark_success(&origin.key);
+                                    }
+                                }
+                                Err(err) => {
+                                    if let Ok(mut tracker) = tracker.lock() {
+                                        tracker.mark_failure(&origin.key, err.to_string());
+                                    }
+                                }
+                            }
+                            result
+                        })
+                    })
+                    .collect();
+                handles.into_iter().map(|handle| handle.join()).collect()
+            });
+
+        for (origin, result) in chunk.iter().zip(results) {
+            match result {
+                Ok(Ok(rows)) => {
+                    combined.workspaces.extend(rows.workspaces);
+                    combined.terminals.extend(rows.terminals);
+                }
+                Ok(Err(err)) => {
+                    tracing::warn!(
+                        origin = %origin.key,
+                        label = %origin.label,
+                        error = %err,
+                        "federation poll: skipping origin for this tick"
+                    );
+                }
+                Err(_panic) => {
+                    tracing::warn!(
+                        origin = %origin.key,
+                        label = %origin.label,
+                        error = "origin fetch thread panicked",
+                        "federation poll: skipping origin for this tick"
+                    );
+                }
+            }
+        }
+    }
+    combined
 }
 
 /// Upper bound on simultaneously-inflight origin fetches. Federation fans out one
