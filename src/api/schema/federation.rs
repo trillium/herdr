@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Status of a single federated origin.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum OriginStatusKind {
     /// Origin has never been polled.
