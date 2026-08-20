@@ -29,6 +29,7 @@
 
 mod control;
 mod discovery;
+pub mod diagnostics;
 mod ingest;
 mod label;
 mod live_view;
