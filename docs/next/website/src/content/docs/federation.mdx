@@ -1,0 +1,203 @@
+---
+title: Fleet Federation
+description: Aggregate remote herdr instances into a unified view
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+Herdr **federation** lets you see and control remote herdr instances from your local machine's sidebar. All agents across your fleet appear in one place, unifying your terminal multiplexing across machines.
+
+## How it works
+
+Federation discovers remote herdr servers on your local network (via Tailscale) or static configuration, polls their agent sessions periodically (~5s), and projects them into your sidebar as foreign workspaces and panes. Remote panes behave like local ones: you can see their status, approve/deny agents, send input, and capture frames live.
+
+**Topology**: Star topology with your laptop as the hub. Remote machines (mini1, mini2, etc.) each run their own herdr server; your laptop aggregates them all.
+
+## Enabling federation
+
+Federation is gated behind a feature flag. Enable it in your config:
+
+```toml
+[experimental]
+federation = true
+```
+
+Restart herdr for the flag to take effect. Federation remains off by default; enable it only if you plan to use it, as federation polling consumes resources.
+
+## Discovering origins
+
+Herdr discovers remote herdr servers ("origins") in two ways:
+
+### Tailscale peers (automatic)
+
+If you use Tailscale, herdr automatically discovers online Tailscale peers that have herdr running. Each peer's herdr server is reached via an `ssh -L`-forwarded socket.
+
+**Requirements:**
+- Tailscale installed and connected on all machines
+- herdr running on all machines
+- SSH configured with `ControlPersist` for stable forwarding
+
+**How it works:**
+1. Herdr runs `tailscale status --json` to list online peers
+2. For each peer, it forwards its herdr JSON API socket over SSH
+3. Forwarded sockets land in `$TMPDIR/herdr-federation/<tailscale-id>.sock`
+4. Herdr polls each socket's `/session/snapshot` endpoint
+
+### Static origins (manual)
+
+For non-Tailscale machines or to override Tailscale labels, configure static origins via environment variable:
+
+```bash
+export HERDR_FEDERATION_ORIGINS='mini1=/tmp/mini1.sock;backup-box=/home/you/remote-herdr.sock'
+```
+
+Each entry is `key=local_socket_path`, where:
+- `key` is a stable identifier (Tailscale node ID or custom name)
+- `local_socket_path` is where herdr's JSON API socket is reachable locally
+
+You must set up the forwarding yourself (e.g., `ssh -L /tmp/mini1.sock:localhost:$HERDR_SOCKET ...`).
+
+## Configuration
+
+### Environment variables
+
+| Variable | Purpose | Default |
+|----------|---------|---------|
+| `HERDR_FEDERATION_ORIGINS` | Static origin overrides (see above) | (unset) |
+| `HERDR_FEDERATION_SOCKET_DIR` | Directory for forwarded Tailscale peer sockets | `$TMPDIR/herdr-federation` |
+
+### Config file
+
+In your `~/.config/herdr/config.toml`:
+
+```toml
+[experimental]
+federation = true
+federation_socket_dir = "/tmp/my-federation"
+```
+
+## Troubleshooting
+
+### Remote panes not appearing
+
+**Check federation is enabled:**
+```bash
+herdr config get experimental.federation
+# Should output: true
+```
+
+**Check origin discovery:**
+
+For Tailscale peers, run `tailscale status` and confirm peers are online. Herdr respects offline status and will not contact sleeping machines.
+
+For static origins, check the socket paths exist and are reachable:
+```bash
+ls -la /tmp/herdr-federation/*.sock
+# Or your configured socket directory
+```
+
+**Check socket connectivity:**
+
+From your hub machine, try connecting directly to a remote socket:
+```bash
+echo '{"id":"test","method":"session.snapshot","params":{}}' | nc -U /tmp/herdr-federation/<remote-id>.sock
+```
+
+You should receive a JSON response. If not, the forwarding is down or the remote herdr is not running.
+
+### Performance degradation
+
+Federation polling runs every ~5 seconds. If you experience lag:
+- Check `herdr logs` for federation poll timing warnings
+- Reduce the number of origins (disable overrides you don't use)
+- Increase the federation poll interval by lowering `experimental.federation_timeout` (future feature)
+
+### Version skew
+
+If remote herdr instances are on different protocol versions than your hub, live terminal frames may fail to render. This is by design: the render wire protocol is strict to prevent protocol confusion.
+
+**Fix**: Ensure all machines are on the same herdr version. Use stable or preview exclusively, not a mix.
+
+```bash
+herdr --version  # Check hub version
+# Then SSH to each origin and check: herdr --version
+```
+
+## Limitations & known issues
+
+- **Read-only in Phase 1**: Typing into foreign panes relays input to the remote PTY, but workspace/tab mutations (create/delete/rename) are not federated. You must make structural changes on the originating machine.
+- **No bidirectional federation**: Federation is unidirectional hub → spoke. If machine A federates B and B federates A, the same sessions appear twice.
+- **Offline machines**: Sleeping or unreachable machines drop from the sidebar silently. Their workspaces vanish; when they wake, they reappear on the next poll.
+- **Secret aggregation**: Remote panes display live agent output, which may include `.env` files, tokens, or credentials. Federation collects all secrets onto one screen. Use responsibly.
+- **No remote notifications**: OS notifications for remote agent events are not yet supported.
+
+## Examples
+
+### Tailscale federation
+
+On all machines, ensure Tailscale is running and herdr is configured:
+
+```bash
+# On all machines
+tailscale up
+herdr-user $ herdr --version  # Confirm herdr is running
+```
+
+On your hub machine:
+
+```bash
+$ cat ~/.config/herdr/config.toml
+[experimental]
+federation = true
+
+# Restart herdr
+$ herdr server restart
+```
+
+Your remote machines should now appear in the sidebar under their Tailscale names (e.g., "macbook", "mini1").
+
+### Static origin with ssh -L
+
+To forward a machine not on Tailscale:
+
+```bash
+# On hub machine, create a persistent forward in a tmux session or multiplexer
+$ ssh -L /tmp/backup.sock:localhost:/home/user/.herdr/socket user@backup-box -N
+```
+
+Then configure:
+
+```bash
+export HERDR_FEDERATION_ORIGINS='backup=/tmp/backup.sock'
+# Restart herdr or reload config
+```
+
+### Custom socket directory
+
+To use a custom location for federation sockets:
+
+```bash
+export HERDR_FEDERATION_SOCKET_DIR="/mnt/ssd/herdr-federation"
+export HERDR_FEDERATION_ORIGINS='static1=/mnt/ssd/herdr-federation/static1.sock'
+```
+
+Ensure the directory is owned by your user and has `700` permissions:
+
+```bash
+mkdir -p /mnt/ssd/herdr-federation
+chmod 700 /mnt/ssd/herdr-federation
+```
+
+## Security
+
+Federation is designed for same-user fleets over trusted networks (e.g., Tailscale VPN, LAN). Each origin's socket is a Unix domain socket (0600 owner-only) on the hub machine, and SSH is the transport. No network listeners are exposed.
+
+**Do not:**
+- Enable federation on untrusted networks without additional security (firewall rules, VPN)
+- Run herdr on shared machines without isolating user sessions
+- Expose `HERDR_FEDERATION_SOCKET_DIR` or forwarded sockets to other users
+
+**Recommended:**
+- Use Tailscale or a similar VPN for transport
+- Keep herdr and SSH keys secure and up to date
+- Monitor `herdr logs federation` for unexpected errors
