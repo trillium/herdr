@@ -3345,7 +3345,15 @@ impl HeadlessServer {
                 };
                 if let Some((terminal_id, cell_size)) = direct_terminal_id {
                     if let Some(runtime) = self.runtime_for_terminal_id_string(&terminal_id) {
-                        runtime.resize(rows, cols, cell_size.width_px, cell_size.height_px);
+                        let (effective_cols, effective_rows) = self
+                            .effective_attach_size(&terminal_id)
+                            .unwrap_or((cols, rows));
+                        runtime.resize(
+                            effective_rows,
+                            effective_cols,
+                            cell_size.width_px,
+                            cell_size.height_px,
+                        );
                     }
                     return true;
                 }
@@ -6959,6 +6967,46 @@ next_tab = ""
 
             assert!(server.handle_server_event(ServerEvent::ClientDetach { client_id: 8 }));
             assert_eq!(runtime(server), (30, 100));
+        });
+    }
+
+    #[test]
+    fn terminal_attach_client_resize_reapplies_min_size() {
+        with_terminal_session_test_server(|server, _terminal_id, terminal_id_string, _| {
+            connect_pending_terminal_client(server, 7);
+            assert!(
+                server.handle_server_event(ServerEvent::ClientControlTerminal {
+                    client_id: 7,
+                    target: terminal_id_string.clone(),
+                    takeover: false,
+                })
+            );
+
+            connect_pending_terminal_client_with_size(server, 8, 60, 20);
+            assert!(
+                server.handle_server_event(ServerEvent::ClientControlTerminal {
+                    client_id: 8,
+                    target: terminal_id_string.clone(),
+                    takeover: false,
+                })
+            );
+
+            assert!(server.handle_server_event(ServerEvent::ClientResize {
+                client_id: 8,
+                cols: 120,
+                rows: 40,
+                cell_width_px: 0,
+                cell_height_px: 0,
+            }));
+
+            let runtime = server
+                .app
+                .terminal_runtimes
+                .values()
+                .next()
+                .expect("runtime")
+                .current_size();
+            assert_eq!(runtime, (30, 100));
         });
     }
 
