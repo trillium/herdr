@@ -316,8 +316,8 @@ pub struct HeadlessServer {
     server_config_diagnostic: Option<String>,
     /// Server config warning with keybinding diagnostics removed for local-keybinding clients.
     server_config_diagnostic_without_keybindings: Option<String>,
-    /// Writable direct attach owner per terminal id string.
-    terminal_attach_owners: HashMap<String, u64>,
+    /// Writable direct attach clients per terminal id string (shared control).
+    terminal_attach_owners: HashMap<String, HashSet<u64>>,
     /// Deferred application-history reads currently driving alternate-screen viewports.
     pending_alt_screen_reads: Vec<crate::server::alt_screen_read::PendingAltScreenRead>,
     /// Reads waiting for an alternate-screen traversal of the same terminal to finish.
@@ -1644,12 +1644,41 @@ impl HeadlessServer {
         if let Some(removed) = removed {
             crate::server::clipboard_image::remove_files(removed.staged_clipboard_files);
             if let ClientConnectionMode::TerminalAttach { terminal_id } = removed.mode {
-                self.terminal_attach_owners.remove(&terminal_id);
-                if let Some(terminal_id) = self.terminal_id_by_string(&terminal_id) {
-                    self.app
-                        .state
-                        .direct_attach_resize_locks
-                        .remove(&terminal_id);
+                let still_attached = match self.terminal_attach_owners.get_mut(&terminal_id) {
+                    Some(owners) => {
+                        owners.remove(&client_id);
+                        if owners.is_empty() {
+                            self.terminal_attach_owners.remove(&terminal_id);
+                            false
+                        } else {
+                            true
+                        }
+                    }
+                    None => false,
+                };
+                if !still_attached {
+                    if let Some(terminal_id) = self.terminal_id_by_string(&terminal_id) {
+                        self.app
+                            .state
+                            .direct_attach_resize_locks
+                            .remove(&terminal_id);
+                    }
+                } else if let Some((cols, rows)) = self.effective_attach_size(&terminal_id) {
+                    let cell_size = self
+                        .clients
+                        .values()
+                        .find_map(|client| match &client.mode {
+                            ClientConnectionMode::TerminalAttach {
+                                terminal_id: attached,
+                            } if attached == &terminal_id => Some(client.cell_size),
+                            _ => None,
+                        })
+                        .unwrap_or_default();
+                    if let Some(terminal_id) = self.terminal_id_by_string(&terminal_id) {
+                        if let Some(runtime) = self.app.terminal_runtimes.get(&terminal_id) {
+                            runtime.resize(rows, cols, cell_size.width_px, cell_size.height_px);
+                        }
+                    }
                 }
             }
         }
@@ -2840,7 +2869,7 @@ impl HeadlessServer {
         &mut self,
         client_id: u64,
         terminal_id: String,
-        takeover: bool,
+        _takeover: bool,
     ) -> bool {
         if !self.client_is_pending_terminal_mode(client_id) {
             self.send_to_client(
@@ -2886,30 +2915,11 @@ impl HeadlessServer {
             return false;
         }
 
-        if let Some(existing_owner) = self.terminal_attach_owners.get(&terminal_id).copied() {
-            if existing_owner != client_id && !takeover {
-                self.send_to_client(
-                    client_id,
-                    ServerMessage::ServerShutdown {
-                        reason: Some(format!(
-                            "terminal attach failed: terminal {terminal_id} already has an attached client; retry with --takeover"
-                        )),
-                    },
-                );
-                self.remove_client_and_resize_if_needed(client_id);
-                return false;
-            }
-            if existing_owner != client_id {
-                self.send_to_client(
-                    existing_owner,
-                    ServerMessage::ServerShutdown {
-                        reason: Some("terminal attach taken over".to_owned()),
-                    },
-                );
-                self.remove_client_and_resize_if_needed(existing_owner);
-            }
-        }
-
+        let first_controller = self
+            .terminal_attach_owners
+            .entry(terminal_id.clone())
+            .or_default()
+            .insert(client_id);
         let stamp = self.allocate_activity_stamp();
         let Some(client) = self.clients.get_mut(&client_id) else {
             return false;
@@ -2928,18 +2938,47 @@ impl HeadlessServer {
         }
 
         info!(client_id, cols, rows, terminal_id = %terminal_id, "terminal attach client connected");
-        self.terminal_attach_owners
-            .insert(terminal_id.clone(), client_id);
+        let (effective_cols, effective_rows) = self
+            .effective_attach_size(&terminal_id)
+            .unwrap_or((cols, rows));
         self.app
             .state
             .direct_attach_resize_locks
             .insert(real_terminal_id.clone());
-        self.app
-            .start_pending_agent_resume_for_terminal(&real_terminal_id, rows, cols, true);
+        if first_controller {
+            self.app.start_pending_agent_resume_for_terminal(
+                &real_terminal_id,
+                effective_rows,
+                effective_cols,
+                true,
+            );
+        }
         if let Some(runtime) = self.app.terminal_runtimes.get(&real_terminal_id) {
-            runtime.resize(rows, cols, cell_size.width_px, cell_size.height_px);
+            runtime.resize(
+                effective_rows,
+                effective_cols,
+                cell_size.width_px,
+                cell_size.height_px,
+            );
         }
         true
+    }
+
+    fn effective_attach_size(&self, terminal_id: &str) -> Option<(u16, u16)> {
+        self.clients
+            .values()
+            .fold(None, |acc, client| match &client.mode {
+                ClientConnectionMode::TerminalAttach {
+                    terminal_id: attached,
+                } if attached == terminal_id => {
+                    let (cols, rows) = client.terminal_size;
+                    Some(match acc {
+                        None => (cols, rows),
+                        Some((acc_cols, acc_rows)) => (acc_cols.min(cols), acc_rows.min(rows)),
+                    })
+                }
+                _ => acc,
+            })
     }
 
     fn client_is_pending_terminal_mode(&self, client_id: u64) -> bool {
@@ -6593,6 +6632,27 @@ next_tab = ""
         control_rx
     }
 
+    fn connect_pending_terminal_client_with_size(
+        server: &mut HeadlessServer,
+        client_id: u64,
+        cols: u16,
+        rows: u16,
+    ) {
+        let (writer, _control_rx, _render_rx) = test_client_writer();
+        assert!(server.handle_server_event(ServerEvent::ClientConnected {
+            client_id,
+            cols,
+            rows,
+            cell_width_px: 0,
+            cell_height_px: 0,
+            render_encoding: RenderEncoding::TerminalAnsi,
+            keybindings: None,
+            direct_attach_requested: true,
+            direct_graphics: false,
+            writer,
+        }));
+    }
+
     #[test]
     fn explicit_agent_history_read_requires_idle_on_alternate_screen() {
         with_terminal_session_test_server(
@@ -6731,8 +6791,11 @@ next_tab = ""
                         if attached == &terminal_id_string
                 ));
                 assert_eq!(
-                    server.terminal_attach_owners.get(&terminal_id_string),
-                    Some(&7)
+                    server
+                        .terminal_attach_owners
+                        .get(&terminal_id_string)
+                        .is_some_and(|owners| owners.contains(&7)),
+                    true
                 );
                 assert!(server
                     .app
@@ -6797,7 +6860,7 @@ next_tab = ""
     }
 
     #[test]
-    fn terminal_control_rejects_second_controller_without_takeover() {
+    fn terminal_control_allows_second_shared_controller() {
         with_terminal_session_test_server(|server, _terminal_id, terminal_id_string, _| {
             connect_pending_terminal_client(server, 7);
             assert!(
@@ -6810,7 +6873,7 @@ next_tab = ""
 
             connect_pending_terminal_client(server, 8);
             assert!(
-                !server.handle_server_event(ServerEvent::ClientControlTerminal {
+                server.handle_server_event(ServerEvent::ClientControlTerminal {
                     client_id: 8,
                     target: terminal_id_string.clone(),
                     takeover: false,
@@ -6818,16 +6881,19 @@ next_tab = ""
             );
 
             assert!(server.clients.contains_key(&7));
-            assert!(!server.clients.contains_key(&8));
+            assert!(server.clients.contains_key(&8));
             assert_eq!(
-                server.terminal_attach_owners.get(&terminal_id_string),
-                Some(&7)
+                server
+                    .terminal_attach_owners
+                    .get(&terminal_id_string)
+                    .map(|owners| owners.len()),
+                Some(2)
             );
         });
     }
 
     #[test]
-    fn terminal_control_takeover_replaces_existing_controller() {
+    fn terminal_control_takeover_joins_without_evicting() {
         with_terminal_session_test_server(|server, _terminal_id, terminal_id_string, _| {
             connect_pending_terminal_client(server, 7);
             assert!(
@@ -6847,12 +6913,52 @@ next_tab = ""
                 })
             );
 
-            assert!(!server.clients.contains_key(&7));
+            assert!(server.clients.contains_key(&7));
             assert!(server.clients.contains_key(&8));
             assert_eq!(
-                server.terminal_attach_owners.get(&terminal_id_string),
-                Some(&8)
+                server
+                    .terminal_attach_owners
+                    .get(&terminal_id_string)
+                    .map(|owners| owners.len()),
+                Some(2)
             );
+        });
+    }
+
+    #[test]
+    fn terminal_attach_normalizes_to_smallest_client_and_grows_back() {
+        with_terminal_session_test_server(|server, _terminal_id, terminal_id_string, _| {
+            connect_pending_terminal_client(server, 7);
+            assert!(
+                server.handle_server_event(ServerEvent::ClientControlTerminal {
+                    client_id: 7,
+                    target: terminal_id_string.clone(),
+                    takeover: false,
+                })
+            );
+            let runtime = |server: &HeadlessServer| {
+                server
+                    .app
+                    .terminal_runtimes
+                    .values()
+                    .next()
+                    .expect("runtime")
+                    .current_size()
+            };
+            assert_eq!(runtime(server), (30, 100));
+
+            connect_pending_terminal_client_with_size(server, 8, 60, 20);
+            assert!(
+                server.handle_server_event(ServerEvent::ClientControlTerminal {
+                    client_id: 8,
+                    target: terminal_id_string.clone(),
+                    takeover: false,
+                })
+            );
+            assert_eq!(runtime(server), (20, 60));
+
+            assert!(server.handle_server_event(ServerEvent::ClientDetach { client_id: 8 }));
+            assert_eq!(runtime(server), (30, 100));
         });
     }
 
@@ -6876,10 +6982,10 @@ next_tab = ""
                 })
             );
 
-            assert_eq!(
-                server.terminal_attach_owners.get(&terminal_id_string),
-                Some(&7)
-            );
+            assert!(server
+                .terminal_attach_owners
+                .get(&terminal_id_string)
+                .is_some_and(|owners| owners.contains(&7)));
             assert!(matches!(
                 server.clients.get(&8).map(|client| &client.mode),
                 Some(ClientConnectionMode::TerminalObserve { terminal_id })
@@ -6954,10 +7060,10 @@ next_tab = ""
                     takeover: false,
                 })
             );
-            assert_eq!(
-                server.terminal_attach_owners.get(&terminal_id_string),
-                Some(&7)
-            );
+            assert!(server
+                .terminal_attach_owners
+                .get(&terminal_id_string)
+                .is_some_and(|owners| owners.contains(&7)));
             assert!(server
                 .app
                 .state
@@ -7181,7 +7287,10 @@ next_tab = ""
                 takeover: false,
             })
         );
-        assert_eq!(server.terminal_attach_owners.get(&terminal_id), Some(&7));
+        assert!(server
+            .terminal_attach_owners
+            .get(&terminal_id)
+            .is_some_and(|owners| owners.contains(&7)));
 
         assert!(server.handle_internal_event_with_forwarding(AppEvent::PaneDied { pane_id }));
 
