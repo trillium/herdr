@@ -16,6 +16,10 @@ test-one filter:
 ui-hot-path-architecture-test:
     python3 -m unittest scripts.test_ui_hot_path_architecture
 
+# Verify fork-specific federation extensions survived an upstream merge
+provenance-check:
+    @bash provenance/check.sh
+
 # Run fast local lint checks
 [unix]
 lint:

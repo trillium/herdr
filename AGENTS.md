@@ -364,3 +364,23 @@ bd prime                # Refresh Beads context
 
 **Architecture in one line:** issues live in a local Dolt DB; sync uses `refs/dolt/data` on your git remote; `.beads/issues.jsonl` is a passive export. See https://github.com/gastownhall/beads/blob/main/docs/SYNC_CONCEPTS.md for details and anti-patterns.
 <!-- END BEADS CODEX SETUP -->
+
+## Maintaining this file
+
+Keep this file for knowledge useful to almost every future agent session in this project.
+Do not repeat what the codebase already shows; point to the authoritative file or command instead.
+Prefer rewriting or pruning existing entries over appending new ones.
+When updating this file, preserve this bar for all agents and keep entries concise.
+
+## Fork provenance checking
+
+This fork adds the fleet federation module (`src/federation/`) on top of upstream
+herdr. After any rebase, merge, or cherry-pick from upstream, run:
+
+```bash
+just provenance-check
+```
+
+It verifies every fork-specific extension is still present. `provenance/register.toml`
+documents what is registered and why; `provenance/check.sh` implements the checks.
+When you add a fork-only feature, add an entry to both.

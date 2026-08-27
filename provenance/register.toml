@@ -1,0 +1,98 @@
+# herdr-oss fork feature provenance registry
+#
+# Every entry here is a trillium/herdr fork extension that does not exist
+# upstream. When upstream advances and this fork is rebased or merged, these
+# are the things that can silently disappear.
+#
+# This file is documentation and the source of truth for what must exist.
+# The checks are implemented directly in provenance/check.sh (parsing TOML in
+# bash is fragile) — keep the two in sync: add an entry here, add the matching
+# check_* line there.
+#
+# Run: bash provenance/check.sh   (from the repo root)
+#   or: just provenance-check
+
+[[feature]]
+id = "federation-module"
+description = "src/federation/ — entire fleet federation module"
+check = "dir:src/federation"
+
+[[feature]]
+id = "federation-origin-key"
+description = "OriginKey — durable Tailscale StableNodeID identity type (survives reboot/IP churn)"
+check = "grep:src/federation/origin.rs:pub struct OriginKey"
+
+[[feature]]
+id = "federation-connection-target"
+description = "ConnectionTarget — transport abstraction kept separate from identity"
+check = "grep:src/federation/origin.rs:pub enum ConnectionTarget"
+
+[[feature]]
+id = "federation-registry"
+description = "FederationRegistry — BTreeMap keyed by OriginKey for deterministic sidebar order"
+check = "grep:src/federation/registry.rs:pub struct FederationRegistry"
+
+[[feature]]
+id = "federation-reconcile"
+description = "reconcile() — ReconcileDelta{added,updated,removed} for splice/drop of foreign rows"
+check = "grep:src/federation/registry.rs:pub fn reconcile"
+
+[[feature]]
+id = "federation-ingest"
+description = "ForeignRows — pure snapshot→rows ingest mapper (N1a)"
+check = "grep:src/federation/ingest.rs:pub struct ForeignRows"
+
+[[feature]]
+id = "federation-namespace"
+description = "fed~<key>~<raw> terminal-id namespacing prevents cross-server pane id collisions"
+check = "grep:src/federation/namespace.rs:namespace_terminal_id"
+
+[[feature]]
+id = "federation-namespace-prefix"
+description = "fed~ prefix constant for namespaced foreign pane ids"
+check = "grep:src/federation/namespace.rs:FED_PREFIX"
+
+[[feature]]
+id = "federation-poll"
+description = "collect_foreign_rows — async snapshot poll loop (N1c)"
+check = "grep:src/federation/poll.rs:collect_foreign_rows"
+
+[[feature]]
+id = "federation-relay"
+description = "send_input_to_foreign_pane — input relay for federated panes (N1d)"
+check = "grep:src/federation/relay.rs:pub fn send_input_to_foreign_pane"
+
+[[feature]]
+id = "federation-config"
+description = "FederationConfig — per-origin display config in the config model"
+check = "grep:src/config/model.rs:pub struct FederationConfig"
+
+[[feature]]
+id = "federation-app-integration"
+description = "spawn_federation_poll — federation poll loop wired into App lifecycle"
+check = "grep:src/app/mod.rs:spawn_federation_poll"
+
+[[feature]]
+id = "federation-foreign-rows-channel"
+description = "foreign_rows_tx channel wired into AppState"
+check = "grep:src/app/mod.rs:foreign_rows_tx"
+
+[[feature]]
+id = "federation-input-terminal"
+description = "Foreign pane input relay wired into the terminal input handler"
+check = "grep:src/app/input/terminal.rs:foreign"
+
+[[feature]]
+id = "federation-status"
+description = "FederationStatusTracker — per-origin status tracking for fleet observability"
+check = "grep:src/federation/status.rs:pub struct FederationStatusTracker"
+
+[[feature]]
+id = "federation-fleet-cli"
+description = "herdr fleet status / doctor CLI command implementation"
+check = "grep:src/cli/fleet.rs:pub(crate) fn run_fleet_command"
+
+[[feature]]
+id = "federation-fleet-cli-dispatch"
+description = "\"fleet\" subcommand dispatched from the CLI entrypoint (src/cli.rs)"
+check = "grep:src/cli.rs:fleet::run_fleet_command"
