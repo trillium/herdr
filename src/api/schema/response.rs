@@ -210,6 +210,9 @@ pub enum ResponseResult {
         changed: bool,
         reason: ClientWindowTitleReason,
     },
+    ClientsDisconnected {
+        disconnected: usize,
+    },
     IntegrationInstall {
         target: IntegrationTarget,
         details: IntegrationInstallResult,

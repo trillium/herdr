@@ -13,6 +13,7 @@ pub(super) fn run_server_command(args: &[String]) -> std::io::Result<Option<i32>
         "agent-manifests" => server_agent_manifests(&args[1..]).map(Some),
         "update-agent-manifests" => server_update_agent_manifests(&args[1..]).map(Some),
         "reload-agent-manifests" => server_reload_agent_manifests(&args[1..]).map(Some),
+        "disconnect-clients" => server_disconnect_clients(&args[1..]).map(Some),
         "help" | "--help" | "-h" => {
             print_server_help();
             Ok(Some(0))
@@ -82,6 +83,18 @@ fn server_reload_agent_manifests(args: &[String]) -> std::io::Result<i32> {
     super::print_response(&super::send_request(&Request {
         id: "cli:server:reload-agent-manifests".into(),
         method: Method::ServerReloadAgentManifests(EmptyParams::default()),
+    })?)
+}
+
+fn server_disconnect_clients(args: &[String]) -> std::io::Result<i32> {
+    if !args.is_empty() {
+        eprintln!("usage: herdr server disconnect-clients");
+        return Ok(2);
+    }
+
+    super::print_response(&super::send_request(&Request {
+        id: "cli:server:disconnect-clients".into(),
+        method: Method::ClientDisconnectAll(EmptyParams::default()),
     })?)
 }
 
@@ -258,6 +271,9 @@ fn print_server_help() {
     eprintln!("  herdr server stop           stop the running server via the API socket");
     eprintln!("  herdr server live-handoff   hand off live panes to a new local server");
     eprintln!("  herdr server reload-config  reload config.toml in the running server");
+    eprintln!(
+        "  herdr server disconnect-clients  disconnect attached clients; server keeps running"
+    );
     eprintln!("  herdr server agent-manifests [--json]  show agent detection manifest status");
     eprintln!("  herdr server update-agent-manifests [--json]  fetch and reload agent detection manifests");
     eprintln!("  herdr server reload-agent-manifests  reload agent detection manifests in the running server");

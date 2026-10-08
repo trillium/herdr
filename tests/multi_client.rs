@@ -1083,6 +1083,76 @@ fn multi_client_smallest_leaving_resizes_up_for_remaining_clients() {
 }
 
 #[test]
+fn client_disconnect_all_severs_clients_but_keeps_server_and_panes() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let client_socket = runtime_dir.join("herdr-client.sock");
+
+    let server = spawn_server(&config_home, &runtime_dir, &api_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    wait_for_file(&client_socket, Duration::from_secs(10));
+
+    let (_workspace_id, pane_id) = create_workspace_and_root_pane(&api_socket, "kick-all");
+
+    let mut first = connect_raw_client(&client_socket, 120, 40);
+    let mut second = connect_raw_client(&client_socket, 100, 30);
+    assert!(wait_for_frame(&mut first, Duration::from_secs(2)));
+    assert!(wait_for_frame(&mut second, Duration::from_secs(2)));
+
+    let response = send_json_request(
+        &api_socket,
+        r#"{"id":"kick","method":"client.disconnect_all","params":{}}"#,
+    );
+    assert_eq!(
+        response.pointer("/result/type").and_then(Value::as_str),
+        Some("clients_disconnected"),
+        "unexpected response: {response}"
+    );
+    assert_eq!(
+        response
+            .pointer("/result/disconnected")
+            .and_then(Value::as_u64),
+        Some(2)
+    );
+
+    // Each client is told to disconnect (ServerMessage::ServerShutdown = variant 4).
+    for stream in [&mut first, &mut second] {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut notified = false;
+        while Instant::now() < deadline {
+            match read_server_message_payload(stream, Duration::from_millis(200)) {
+                Ok((4, _)) => {
+                    notified = true;
+                    break;
+                }
+                Ok(_) => continue,
+                Err(err) if is_timeout(&err) => continue,
+                Err(_) => break,
+            }
+        }
+        assert!(notified, "client should receive a server shutdown notice");
+    }
+
+    // The server, its panes, and the client socket survive; reconnecting works.
+    assert!(ping_socket(&api_socket).contains("pong"));
+    let panes = send_json_request(
+        &api_socket,
+        r#"{"id":"panes","method":"pane.list","params":{}}"#,
+    );
+    assert!(
+        panes.to_string().contains(&pane_id),
+        "pane should survive disconnect_all: {panes}"
+    );
+    let mut reconnected = connect_raw_client(&client_socket, 90, 30);
+    assert!(wait_for_frame(&mut reconnected, Duration::from_secs(3)));
+
+    cleanup_spawned_herdr(server, base);
+}
+
+#[test]
 fn multi_client_client_crash_sigkill_does_not_affect_server() {
     let _lock = test_lock();
     let base = unique_test_dir();
