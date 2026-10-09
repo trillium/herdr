@@ -1020,8 +1020,6 @@ where
     R: tokio::io::AsyncReadExt + Unpin,
     M: for<'de> Deserialize<'de>,
 {
-    use tokio::io::AsyncReadExt;
-
     let mut len_buf = [0u8; LENGTH_PREFIX_BYTES];
     reader.read_exact(&mut len_buf).await.map_err(|e| {
         if e.kind() == io::ErrorKind::UnexpectedEof {
