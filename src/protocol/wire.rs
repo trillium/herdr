@@ -1048,9 +1048,8 @@ where
         }
     })?;
 
-    let (msg, consumed) =
-        bincode::serde::decode_from_slice(&payload, bincode::config::standard())
-            .map_err(|e| FramingError::Bincode(e.to_string()))?;
+    let (msg, consumed) = bincode::serde::decode_from_slice(&payload, bincode::config::standard())
+        .map_err(|e| FramingError::Bincode(e.to_string()))?;
 
     if consumed != claimed_len {
         return Err(FramingError::Bincode(format!(

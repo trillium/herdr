@@ -206,7 +206,12 @@ mod tests {
         let key = OriginKey::new("test-origin").unwrap();
 
         tracker.mark_failure(&key, "timeout");
-        assert_eq!(tracker.get_status(&key), OriginStatus::Unreachable { error: "timeout".to_string() });
+        assert_eq!(
+            tracker.get_status(&key),
+            OriginStatus::Unreachable {
+                error: "timeout".to_string()
+            }
+        );
 
         // Recovery should reset failure count
         tracker.mark_success(&key);

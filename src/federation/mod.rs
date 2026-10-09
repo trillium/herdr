@@ -28,8 +28,8 @@
 #![allow(dead_code, unused_imports)]
 
 mod control;
-mod discovery;
 pub mod diagnostics;
+mod discovery;
 mod ingest;
 mod label;
 mod live_view;
@@ -56,8 +56,8 @@ pub use namespace::{
 pub use observe::{spawn_foreign_observer, ForeignFrame, ForeignObserveHandle};
 pub use origin::{ConnectionTarget, InvalidOriginKey, Origin, OriginKey};
 pub use poll::collect_foreign_rows;
-pub use status::{FederationStatusTracker, OriginStatus, OriginStatusDetail};
 pub use registry::{FederationRegistry, ReconcileDelta};
+pub use status::{FederationStatusTracker, OriginStatus, OriginStatusDetail};
 
 /// Message sent from the federation poll task to the run loop on the
 /// `foreign_rows` channel. Carries either the initial origin discovery

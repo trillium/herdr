@@ -1613,7 +1613,10 @@ impl AppState {
         // strip. build_tab always finishes with focus on the last pane; without
         // this, every poll tick resets pane focus to the rightmost pane even
         // when the user explicitly navigated to a different one.
-        let focused_pane_terminal_ids: std::collections::HashMap<String, crate::terminal::TerminalId> = self
+        let focused_pane_terminal_ids: std::collections::HashMap<
+            String,
+            crate::terminal::TerminalId,
+        > = self
             .workspaces
             .iter()
             .filter(|ws| crate::federation::is_foreign_workspace_id(&ws.id))
