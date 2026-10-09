@@ -171,6 +171,10 @@ fn server_command() -> Command {
         .subcommand(Command::new("stop").about("Stop the running server"))
         .subcommand(Command::new("reload-config").about("Reload config in the running server"))
         .subcommand(
+            Command::new("disconnect-clients")
+                .about("Disconnect all attached clients; the server and its panes keep running"),
+        )
+        .subcommand(
             Command::new("agent-manifests")
                 .about("Show active agent detection manifests")
                 .arg(json_flag()),

@@ -83,17 +83,16 @@ pub(super) fn encode_api_input(
 }
 
 /// Encode text + keys for a foreign pane (no local runtime) using Legacy VT100.
-pub(super) fn encode_api_input_legacy(
-    text: &str,
-    keys: &[String],
-) -> Result<Vec<u8>, String> {
+pub(super) fn encode_api_input_legacy(text: &str, keys: &[String]) -> Result<Vec<u8>, String> {
     let mut bytes = text.as_bytes().to_vec();
     for key in keys {
         let Some(key_event) = parse_api_key(key) else {
             return Err(key.clone());
         };
-        let encoded =
-            crate::input::encode_terminal_key(key_event.into(), crate::input::KeyboardProtocol::Legacy);
+        let encoded = crate::input::encode_terminal_key(
+            key_event.into(),
+            crate::input::KeyboardProtocol::Legacy,
+        );
         bytes.extend_from_slice(&encoded);
     }
     Ok(bytes)

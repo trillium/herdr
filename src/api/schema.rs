@@ -61,6 +61,8 @@ pub enum Method {
     ClientWindowTitleSet(ClientWindowTitleSetParams),
     #[serde(rename = "client.window_title.clear")]
     ClientWindowTitleClear(EmptyParams),
+    #[serde(rename = "client.disconnect_all")]
+    ClientDisconnectAll(EmptyParams),
     #[serde(rename = "session.snapshot")]
     SessionSnapshot(EmptyParams),
     #[serde(rename = "workspace.create")]

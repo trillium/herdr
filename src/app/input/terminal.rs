@@ -36,17 +36,11 @@ fn relay_workers() -> &'static Mutex<HashMap<String, tokio::sync::mpsc::Sender<R
 /// Direct control senders for foreign terminals with active ControlTerminal
 /// connections. Keyed by namespaced terminal id (`fed~<key>~<raw>`).
 static CONTROL_SENDERS: OnceLock<
-    Mutex<
-        HashMap<
-            String,
-            tokio::sync::mpsc::Sender<crate::federation::ControlCommand>,
-        >,
-    >,
+    Mutex<HashMap<String, tokio::sync::mpsc::Sender<crate::federation::ControlCommand>>>,
 > = OnceLock::new();
 
-fn control_senders() -> &'static Mutex<
-    HashMap<String, tokio::sync::mpsc::Sender<crate::federation::ControlCommand>>,
-> {
+fn control_senders(
+) -> &'static Mutex<HashMap<String, tokio::sync::mpsc::Sender<crate::federation::ControlCommand>>> {
     CONTROL_SENDERS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 

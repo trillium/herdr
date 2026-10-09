@@ -2813,6 +2813,29 @@ impl HeadlessServer {
         }
     }
 
+    /// Severs every client connection while leaving the server, sessions,
+    /// panes and agents running. Clients may reconnect immediately.
+    fn disconnect_all_clients(&mut self, reason: &str) -> usize {
+        let client_ids = self.clients.keys().copied().collect::<Vec<_>>();
+        for &client_id in &client_ids {
+            self.send_client_graphics_cleanup(client_id);
+            self.send_to_client(
+                client_id,
+                ServerMessage::ServerShutdown {
+                    reason: Some(reason.to_owned()),
+                },
+            );
+            if let Some(client) = self.clients.get_mut(&client_id) {
+                client.writer = None;
+            }
+            let _ = self.remove_client(client_id);
+        }
+        self.foreground_client_id = None;
+        self.sync_foreground_client_state();
+        self.resize_shared_runtime_to_effective_size();
+        client_ids.len()
+    }
+
     #[cfg(unix)]
     fn disconnect_all_clients_for_handoff(&mut self) {
         let client_ids = self.clients.keys().copied().collect::<Vec<_>>();
@@ -3702,6 +3725,16 @@ impl HeadlessServer {
         }
 
         match &msg.request.method {
+            api::schema::Method::ClientDisconnectAll(_) => {
+                let disconnected = self.disconnect_all_clients("disconnected by server request");
+                let response = serde_json::to_string(&api::schema::SuccessResponse {
+                    id: msg.request.id.clone(),
+                    result: api::schema::ResponseResult::ClientsDisconnected { disconnected },
+                })
+                .unwrap_or_else(|_| "{}".to_string());
+                let _ = msg.respond_to.send(response);
+                return true;
+            }
             api::schema::Method::ClientWindowTitleSet(params) => {
                 let response = self.handle_client_window_title_api(
                     msg.request.id.clone(),
@@ -11309,6 +11342,63 @@ next_tab = ""
                 reason: api::schema::NotificationShowReason::NoForegroundClient,
             }
         );
+    }
+
+    #[test]
+    fn client_disconnect_all_api_drops_clients_and_keeps_server_running() {
+        let mut server = test_headless_server();
+        server.app.state.workspaces = vec![crate::workspace::Workspace::test_new("keep")];
+        server.app.state.active = Some(0);
+        let mut control_rxs = Vec::new();
+        for id in 1..=2u64 {
+            let (client_tx, control_rx, _render_rx) = test_client_writer();
+            control_rxs.push(control_rx);
+            server.clients.insert(
+                id,
+                ClientConnection::new(
+                    (80, 24),
+                    crate::kitty_graphics::HostCellSize::default(),
+                    crate::terminal_theme::TerminalTheme::default(),
+                    None,
+                    id,
+                    RenderEncoding::SemanticFrame,
+                    Some(client_tx),
+                ),
+            );
+        }
+        server.promote_client_to_foreground(2);
+
+        let (respond_to, response_rx) = std::sync::mpsc::channel();
+        server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+            request: api::schema::Request {
+                id: "kick".into(),
+                method: api::schema::Method::ClientDisconnectAll(
+                    api::schema::EmptyParams::default(),
+                ),
+            },
+            respond_to,
+            response_write_complete: None,
+            stream_active: None,
+        });
+
+        let response = response_rx
+            .recv_timeout(Duration::from_millis(100))
+            .unwrap();
+        let parsed: api::schema::SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            parsed.result,
+            api::schema::ResponseResult::ClientsDisconnected { disconnected: 2 }
+        );
+        assert!(server.clients.is_empty());
+        assert_eq!(server.foreground_client_id, None);
+        assert!(!server.shutting_down);
+        assert!(!server.app.state.should_quit);
+        assert_eq!(server.app.state.workspaces.len(), 1);
+        for rx in &control_rxs {
+            let frame = rx.try_recv().expect("client receives a shutdown notice");
+            assert!(!frame.is_empty());
+        }
+        shutdown_test_runtimes(&mut server);
     }
 
     #[test]

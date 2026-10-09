@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+### Added
+- `herdr server disconnect-clients` (socket method `client.disconnect_all`) disconnects every attached client while the server, panes, and agents keep running; clients can reconnect immediately.
+
 ### Fixed
 - Claude Code panes now use visible turn, background shell, and background agent activity as working-state fallbacks when OSC titles are unavailable or disabled. (#1630, #2241)
 - Tab bar status commands now remove ESC-prefixed terminal control sequences instead of displaying their sequence bodies as text. (#3001)

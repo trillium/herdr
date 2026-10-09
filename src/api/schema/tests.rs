@@ -296,6 +296,18 @@ fn client_window_title_requests_round_trip() {
 }
 
 #[test]
+fn request_round_trips_for_client_disconnect_all() {
+    let request = Request {
+        id: "req_disconnect_all".into(),
+        method: Method::ClientDisconnectAll(EmptyParams::default()),
+    };
+    let json = serde_json::to_value(&request).unwrap();
+    assert_eq!(json["method"], "client.disconnect_all");
+    let restored: Request = serde_json::from_value(json).unwrap();
+    assert_eq!(restored, request);
+}
+
+#[test]
 fn agent_view_requests_round_trip() {
     let set_json = serde_json::json!({
         "id": "view-set",

@@ -4574,6 +4574,22 @@
         {
           "properties": {
             "method": {
+              "const": "client.disconnect_all",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/EmptyParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "session.snapshot",
               "type": "string"
             },
@@ -9467,6 +9483,24 @@
                 "type",
                 "changed",
                 "reason"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "disconnected": {
+                  "format": "uint",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "type": {
+                  "const": "clients_disconnected",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "disconnected"
               ],
               "type": "object"
             },

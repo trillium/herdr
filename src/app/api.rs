@@ -1000,6 +1000,12 @@ impl App {
             Method::NotificationShow(params) => {
                 return self.handle_notification_show(request.id, params);
             }
+            Method::ClientDisconnectAll(_) => {
+                return responses::encode_success(
+                    request.id,
+                    ResponseResult::ClientsDisconnected { disconnected: 0 },
+                );
+            }
             Method::ClientWindowTitleSet(_) | Method::ClientWindowTitleClear(_) => {
                 return responses::encode_success(
                     request.id,

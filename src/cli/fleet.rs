@@ -33,7 +33,9 @@ fn run_fleet_status(args: &[String]) -> io::Result<i32> {
     // TODO: Fetch status from the running herdr server via the federation API endpoint
     // For now, show a placeholder message
     if use_json {
-        println!(r#"{{"status":"unavailable","message":"federation status endpoint not yet implemented"}}"#);
+        println!(
+            r#"{{"status":"unavailable","message":"federation status endpoint not yet implemented"}}"#
+        );
     } else {
         eprintln!("Federation fleet status is not yet available.");
         eprintln!("To see federation status, enable experimental.federation in your config.");

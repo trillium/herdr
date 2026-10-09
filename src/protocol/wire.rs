@@ -1020,8 +1020,6 @@ where
     R: tokio::io::AsyncReadExt + Unpin,
     M: for<'de> Deserialize<'de>,
 {
-    use tokio::io::AsyncReadExt;
-
     let mut len_buf = [0u8; LENGTH_PREFIX_BYTES];
     reader.read_exact(&mut len_buf).await.map_err(|e| {
         if e.kind() == io::ErrorKind::UnexpectedEof {
@@ -1048,9 +1046,8 @@ where
         }
     })?;
 
-    let (msg, consumed) =
-        bincode::serde::decode_from_slice(&payload, bincode::config::standard())
-            .map_err(|e| FramingError::Bincode(e.to_string()))?;
+    let (msg, consumed) = bincode::serde::decode_from_slice(&payload, bincode::config::standard())
+        .map_err(|e| FramingError::Bincode(e.to_string()))?;
 
     if consumed != claimed_len {
         return Err(FramingError::Bincode(format!(
