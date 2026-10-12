@@ -1,5 +1,8 @@
 # Changelog
 
+## 2026-08-12 — session cefd724d
+
+Files: src/terminal/id.rs, docs/next/website/src/data/config-reference.json, docs/next/CHANGELOG.md, src/app/mod.rs, src/server/headless.rs, src/app/input/terminal.rs, src/federation/ingest.rs
 ## Unreleased
 
 ## [0.8.0] - 2026-08-03
